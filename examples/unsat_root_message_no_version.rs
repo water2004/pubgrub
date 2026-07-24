@@ -84,6 +84,9 @@ impl ReportFormatter<Package, Ranges<SemanticVersion>, String> for CustomReportF
                 }
             }
             External::CustomClause { metadata, .. } => metadata.clone(),
+            External::ExcludedSolution { .. } => {
+                "a solution was excluded while enumerating alternatives".to_string()
+            }
             External::FromDependencyOf(package, package_set, dependency, dependency_set) => {
                 if package_set == &Ranges::full() && dependency_set == &Ranges::full() {
                     format!("{package} depends on {dependency}")

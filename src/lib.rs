@@ -233,8 +233,9 @@ pub use report::{
 };
 pub use solver::{
     Dependencies, DependencyConstraints, DependencyProvider, IncompatibilityConstraint,
-    IncompatibilityConstraintTerm, IncompatibilityConstraints, PackageResolutionStatistics,
-    SelectedDependencies, resolve, resolve_with_observer,
+    IncompatibilityConstraintTerm, IncompatibilityConstraints, MaximalSolutions,
+    PackageResolutionStatistics, SelectedDependencies, resolve, resolve_maximal_solutions,
+    resolve_maximal_solutions_with_observer, resolve_with_observer,
 };
 pub use term::Term;
 pub use type_aliases::{Map, Set};

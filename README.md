@@ -95,6 +95,26 @@ be cloned and rendered with application-specific package names and messages,
 without parsing logs or running a second counterfactual solve. See the runnable
 [`explain_version`](./examples/explain_version.rs) example.
 
+## Enumerating locally maximal solutions
+
+`resolve_maximal_solutions` enumerates every solution in which none of the
+requested packages can be upgraded while every other selected package version
+stays fixed. This is deliberately different from returning every legal version
+combination: dominated combinations are classified and pruned inside the
+solver.
+
+Use `resolve_maximal_solutions_with_observer` when the application also needs
+the real derivation path for each result. It continues one solver session,
+emits `SolverEvent::Solution` once per retained solution, and keeps the
+feasibility probes used for maximality classification out of the observer
+stream. Enumeration clauses have their own `ExcludedSolution` reason, so they
+cannot be mistaken for provider dependency metadata.
+
+The caller supplies the packages to maximize and a function constructing the
+strictly-higher version range. Independent choices can still produce an
+exponential number of maximal solutions; `DependencyProvider::should_cancel`
+is checked throughout enumeration.
+
 ## Provider-defined incompatibilities
 
 Some package metadata cannot be represented as a list of ordinary dependency

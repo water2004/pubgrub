@@ -50,6 +50,9 @@ fn print_external_facts(cause: &Cause) {
             External::CustomClause { metadata, .. } => {
                 println!("  {metadata}");
             }
+            External::ExcludedSolution { .. } => {
+                println!("  a solution was excluded while enumerating alternatives");
+            }
         },
         DerivationTree::Derived(derived) => {
             print_external_facts(&derived.cause1);

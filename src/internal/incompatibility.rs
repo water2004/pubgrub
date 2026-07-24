@@ -74,6 +74,8 @@ enum Kind<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> {
     Custom(Id<P>, VS, M),
     /// A provider-supplied conditional incompatibility.
     CustomClause(M),
+    /// A solver-supplied clause used while enumerating distinct solutions.
+    ExcludedSolution,
 }
 
 /// A Relation describes how a set of terms can be compared to an incompatibility.
@@ -144,6 +146,13 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Incompatibilit
         Self {
             package_terms,
             kind: Kind::CustomClause(metadata),
+        }
+    }
+
+    pub(crate) fn excluded_solution(package_terms: SmallMap<Id<P>, Term<VS>>) -> Self {
+        Self {
+            package_terms,
+            kind: Kind::ExcludedSolution,
         }
     }
 
@@ -334,6 +343,13 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Incompatibilit
                     .map(|(&package, term)| (package_store[package].clone(), term.clone()))
                     .collect(),
                 metadata: metadata.clone(),
+            }),
+            Kind::ExcludedSolution => DerivationTree::External(External::ExcludedSolution {
+                terms: store[self_id]
+                    .package_terms
+                    .iter()
+                    .map(|(&package, term)| (package_store[package].clone(), term.clone()))
+                    .collect(),
             }),
         }
     }

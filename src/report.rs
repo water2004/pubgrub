@@ -53,6 +53,14 @@ pub enum External<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> {
         /// Human-readable reason supplied by the dependency provider.
         metadata: M,
     },
+    /// A solver-owned clause used to continue after an enumerated solution.
+    ///
+    /// This is distinct from provider incompatibilities so consumers never mistake an
+    /// enumeration control constraint for a dependency reason.
+    ExcludedSolution {
+        /// Terms that identify the excluded solution region.
+        terms: Map<P, Term<VS>>,
+    },
 }
 
 /// Incompatibility derived from two others.
@@ -86,7 +94,7 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> DerivationTree
                 | External::Custom(p, _, _) => {
                     packages.insert(p);
                 }
-                External::CustomClause { terms, .. } => {
+                External::CustomClause { terms, .. } | External::ExcludedSolution { terms } => {
                     packages.extend(terms.keys());
                 }
             },
@@ -171,6 +179,7 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> DerivationTree
             // Cannot be merged because the reason may not match
             DerivationTree::External(External::Custom(_, _, _)) => None,
             DerivationTree::External(External::CustomClause { .. }) => None,
+            DerivationTree::External(External::ExcludedSolution { .. }) => None,
         }
     }
 }
@@ -199,6 +208,7 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Display for Ex
                 }
             }
             Self::CustomClause { metadata, .. } => write!(f, "{metadata}"),
+            Self::ExcludedSolution { .. } => write!(f, "an enumerated solution is excluded"),
             Self::FromDependencyOf(p, set_p, dep, set_dep) => {
                 if set_p == &VS::full() && set_dep == &VS::full() {
                     write!(f, "{p} depends on {dep}")

@@ -9,6 +9,9 @@ All notable changes to this project will be documented in this file.
 - Add `resolve_with_observer`, `SolverObserver`, and typed solver events for inspecting the
   decisions, derivations, conflicts, and backtracks of a successful or failed solver run.
 - Add `Term::contains` for checking whether a derivation allows a specific version.
+- Add provider-defined incompatibility clauses with typed metadata.
+- Add `resolve_maximal_solutions` and its observer variant for enumerating every solution in
+  which no requested package can be upgraded while all other selected versions stay fixed.
 
 ## 0.4.0 - 2026-04-09
 

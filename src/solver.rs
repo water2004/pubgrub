@@ -6,7 +6,9 @@ use std::fmt::{Debug, Display};
 
 use crate::internal::{Id, Incompatibility, State};
 use crate::observer::NoopSolverObserver;
-use crate::{Map, Package, PubGrubError, SolverEvent, SolverObserver, Term, VersionSet};
+use crate::{
+    Map, Package, PubGrubError, Set as PackageSet, SolverEvent, SolverObserver, Term, VersionSet,
+};
 use log::{debug, info};
 
 /// Statistics on how often a package conflicted with other packages.
@@ -50,6 +52,9 @@ impl PackageResolutionStatistics {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedDependencies<P: Package, V>(Map<P, V>);
 
+/// All locally maximal solutions returned by [`resolve_maximal_solutions`].
+pub type MaximalSolutions<P, V> = Vec<SelectedDependencies<P, V>>;
+
 impl<P: Package, V> SelectedDependencies<P, V> {
     /// Iterate over the resolved dependencies and their versions.
     pub fn iter(&self) -> impl Iterator<Item = (&P, &V)> {
@@ -74,6 +79,225 @@ impl<P: Package, V> IntoIterator for SelectedDependencies<P, V> {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
+    }
+}
+
+struct SolverState<DP: DependencyProvider> {
+    state: State<DP>,
+    conflict_tracker: Map<Id<DP::P>, PackageResolutionStatistics>,
+    added_dependencies: Map<Id<DP::P>, Set<DP::V>>,
+    next: Id<DP::P>,
+}
+
+impl<DP: DependencyProvider> SolverState<DP> {
+    fn new(package: DP::P, version: DP::V) -> Self {
+        let state = State::init(package, version);
+        let next = state.root_package;
+        Self {
+            state,
+            conflict_tracker: Map::default(),
+            added_dependencies: Map::default(),
+            next,
+        }
+    }
+
+    fn add_solution_exclusion(
+        &mut self,
+        terms: impl IntoIterator<Item = (DP::P, Term<DP::VS>)>,
+    ) -> bool {
+        let added = self.state.add_solution_exclusion(terms);
+        if added {
+            self.next = self.state.root_package;
+        }
+        added
+    }
+
+    fn run_until_solution<O>(
+        &mut self,
+        dependency_provider: &DP,
+        observer: &mut O,
+    ) -> Result<SelectedDependencies<DP::P, DP::V>, PubGrubError<DP>>
+    where
+        O: SolverObserver<DP::P, DP::VS, DP::M>,
+    {
+        loop {
+            dependency_provider
+                .should_cancel()
+                .map_err(PubGrubError::ErrorInShouldCancel)?;
+
+            info!(
+                "unit_propagation: {:?} = '{}'",
+                &self.next, self.state.package_store[self.next]
+            );
+            let satisfier_causes = self
+                .state
+                .unit_propagation_with_observer(self.next, observer)?;
+            for (affected, incompat) in satisfier_causes {
+                self.conflict_tracker
+                    .entry(affected)
+                    .or_default()
+                    .unit_propagation_affected += 1;
+                for (conflict_package, _) in self.state.incompatibility_store[incompat].iter() {
+                    if conflict_package == affected {
+                        continue;
+                    }
+                    self.conflict_tracker
+                        .entry(conflict_package)
+                        .or_default()
+                        .unit_propagation_culprit += 1;
+                }
+            }
+
+            debug!(
+                "Partial solution after unit propagation: {}",
+                self.state
+                    .partial_solution
+                    .display(&self.state.package_store)
+            );
+
+            let Some((highest_priority_pkg, term_intersection)) = self
+                .state
+                .partial_solution
+                .pick_highest_priority_pkg(|p, r| {
+                    dependency_provider.prioritize(
+                        &self.state.package_store[p],
+                        r,
+                        self.conflict_tracker.entry(p).or_default(),
+                    )
+                })
+            else {
+                return Ok(SelectedDependencies(
+                    self.state
+                        .partial_solution
+                        .extract_solution()
+                        .map(|(p, v)| (self.state.package_store[p].clone(), v))
+                        .collect(),
+                ));
+            };
+            self.next = highest_priority_pkg;
+            observer.on_event(SolverEvent::PackageChoice {
+                package: &self.state.package_store[self.next],
+                allowed: term_intersection,
+            });
+
+            let decision = dependency_provider
+                .choose_version(&self.state.package_store[self.next], term_intersection)
+                .map_err(|source| PubGrubError::ErrorChoosingVersion {
+                    package: self.state.package_store[self.next].clone(),
+                    source,
+                })?;
+
+            info!(
+                "DP chose: {:?} = '{}' @ {:?}",
+                &self.next, self.state.package_store[self.next], decision
+            );
+
+            let version = match decision {
+                None => {
+                    observer.on_event(SolverEvent::NoVersion {
+                        package: &self.state.package_store[self.next],
+                        allowed: term_intersection,
+                    });
+                    let incompatibility = Incompatibility::no_versions(
+                        self.next,
+                        Term::Positive(term_intersection.clone()),
+                    );
+                    self.state.add_incompatibility(incompatibility);
+                    continue;
+                }
+                Some(version) => version,
+            };
+            observer.on_event(SolverEvent::VersionChoice {
+                package: &self.state.package_store[self.next],
+                version: &version,
+                allowed: term_intersection,
+            });
+
+            if !term_intersection.contains(&version) {
+                panic!(
+                    "`choose_version` picked an incompatible version for package {}, {} is not in {}",
+                    self.state.package_store[self.next], version, term_intersection
+                );
+            }
+
+            let is_new_dependency = self
+                .added_dependencies
+                .entry(self.next)
+                .or_default()
+                .insert(version.clone());
+
+            if is_new_dependency {
+                let package = self.next;
+                let dependencies = dependency_provider
+                    .get_dependencies(&self.state.package_store[package], &version)
+                    .map_err(|source| PubGrubError::ErrorRetrievingDependencies {
+                        package: self.state.package_store[package].clone(),
+                        version: version.clone(),
+                        source,
+                    })?;
+
+                let dependencies = match dependencies {
+                    Dependencies::Unavailable(reason) => {
+                        self.state
+                            .add_incompatibility(Incompatibility::custom_version(
+                                package, version, reason,
+                            ));
+                        continue;
+                    }
+                    Dependencies::Available(dependencies) => dependencies,
+                };
+                let incompatibilities = dependency_provider
+                    .get_incompatibilities(&self.state.package_store[package], &version)
+                    .map_err(|source| PubGrubError::ErrorRetrievingDependencies {
+                        package: self.state.package_store[package].clone(),
+                        version: version.clone(),
+                        source,
+                    })?;
+
+                match self.state.add_package_version_dependencies(
+                    package,
+                    version.clone(),
+                    dependencies,
+                    incompatibilities,
+                ) {
+                    Some(conflict) => {
+                        self.conflict_tracker
+                            .entry(package)
+                            .or_default()
+                            .dependencies_affected += 1;
+                        for (incompat_package, _) in
+                            self.state.incompatibility_store[conflict].iter()
+                        {
+                            if incompat_package == package {
+                                continue;
+                            }
+                            self.conflict_tracker
+                                .entry(incompat_package)
+                                .or_default()
+                                .dependencies_culprit += 1;
+                        }
+                    }
+                    None => observer.on_event(SolverEvent::Decision {
+                        package: &self.state.package_store[package],
+                        version: &version,
+                        decision_level: self.state.partial_solution.current_decision_level().0,
+                    }),
+                }
+            } else {
+                info!(
+                    "add_decision (not first time): {:?} = '{}' @ {}",
+                    &self.next, self.state.package_store[self.next], version
+                );
+                self.state
+                    .partial_solution
+                    .add_decision(self.next, version.clone());
+                observer.on_event(SolverEvent::Decision {
+                    package: &self.state.package_store[self.next],
+                    version: &version,
+                    decision_level: self.state.partial_solution.current_decision_level().0,
+                });
+            }
+        }
     }
 }
 /// Finds a set of packages satisfying dependency bounds for a given package + version pair.
@@ -162,179 +386,182 @@ where
     DP: DependencyProvider,
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
-    let mut state: State<DP> = State::init(package.clone(), version.into());
-    let mut conflict_tracker: Map<Id<DP::P>, PackageResolutionStatistics> = Map::default();
-    let mut added_dependencies: Map<Id<DP::P>, Set<DP::V>> = Map::default();
-    let mut next = state.root_package;
+    let mut solver = SolverState::new(package, version.into());
+    let solution = solver.run_until_solution(dependency_provider, observer)?;
+    observer.on_event(SolverEvent::Solution);
+    Ok(solution)
+}
+
+/// Finds every solution in which no maximized package can be upgraded while all other selected
+/// package versions remain fixed.
+///
+/// `strictly_higher` must return the version set strictly greater than its argument. The package
+/// iterator controls which packages are considered upgrade targets; all selected packages,
+/// including transitive dependencies, are held fixed while checking an individual upgrade.
+///
+/// Enumeration may be exponential in the number of independent choices. The dependency
+/// provider's [`should_cancel`](DependencyProvider::should_cancel) hook remains active throughout
+/// both enumeration and maximality checks.
+#[cold]
+pub fn resolve_maximal_solutions<DP, I, F>(
+    dependency_provider: &DP,
+    package: DP::P,
+    version: impl Into<DP::V>,
+    maximized_packages: I,
+    strictly_higher: F,
+) -> Result<MaximalSolutions<DP::P, DP::V>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    I: IntoIterator<Item = DP::P>,
+    F: Fn(&DP::V) -> DP::VS,
+{
+    resolve_maximal_solutions_with_observer(
+        dependency_provider,
+        package,
+        version,
+        maximized_packages,
+        strictly_higher,
+        &mut NoopSolverObserver,
+    )
+}
+
+/// Finds every single-package-maximal solution and reports each retained solution's actual solver
+/// path.
+///
+/// [`SolverEvent::Solution`] is emitted once for every returned solution. Intermediate events
+/// between two solution events belong to the continued enumeration path; feasibility probes used
+/// to classify maximality are deliberately not sent to the observer.
+#[cold]
+pub fn resolve_maximal_solutions_with_observer<DP, I, F, O>(
+    dependency_provider: &DP,
+    package: DP::P,
+    version: impl Into<DP::V>,
+    maximized_packages: I,
+    strictly_higher: F,
+    observer: &mut O,
+) -> Result<MaximalSolutions<DP::P, DP::V>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    I: IntoIterator<Item = DP::P>,
+    F: Fn(&DP::V) -> DP::VS,
+    O: SolverObserver<DP::P, DP::VS, DP::M>,
+{
+    let root_version = version.into();
+    let mut seen = PackageSet::default();
+    let maximized_packages: Vec<_> = maximized_packages
+        .into_iter()
+        .filter(|candidate| candidate != &package)
+        .filter(|candidate| seen.insert(candidate.clone()))
+        .collect();
+    let mut solver = SolverState::new(package.clone(), root_version.clone());
+    let mut solutions = Vec::new();
+
     loop {
-        dependency_provider
-            .should_cancel()
-            .map_err(|err| PubGrubError::ErrorInShouldCancel(err))?;
-
-        info!(
-            "unit_propagation: {:?} = '{}'",
-            &next, state.package_store[next]
-        );
-        let satisfier_causes = state.unit_propagation_with_observer(next, observer)?;
-        for (affected, incompat) in satisfier_causes {
-            conflict_tracker
-                .entry(affected)
-                .or_default()
-                .unit_propagation_affected += 1;
-            for (conflict_package, _) in state.incompatibility_store[incompat].iter() {
-                if conflict_package == affected {
-                    continue;
-                }
-                conflict_tracker
-                    .entry(conflict_package)
-                    .or_default()
-                    .unit_propagation_culprit += 1;
+        let solution = match solver.run_until_solution(dependency_provider, observer) {
+            Ok(solution) => solution,
+            Err(PubGrubError::NoSolution(reason)) if solutions.is_empty() => {
+                return Err(PubGrubError::NoSolution(reason));
             }
-        }
+            Err(PubGrubError::NoSolution(_)) => return Ok(solutions),
+            Err(error) => return Err(error),
+        };
 
-        debug!(
-            "Partial solution after unit propagation: {}",
-            state.partial_solution.display(&state.package_store)
-        );
-
-        let Some((highest_priority_pkg, term_intersection)) =
-            state.partial_solution.pick_highest_priority_pkg(|p, r| {
-                dependency_provider.prioritize(
-                    &state.package_store[p],
-                    r,
-                    conflict_tracker.entry(p).or_default(),
-                )
-            })
-        else {
+        if maximized_packages.is_empty() {
             observer.on_event(SolverEvent::Solution);
-            return Ok(SelectedDependencies(
-                state
-                    .partial_solution
-                    .extract_solution()
-                    .map(|(p, v)| (state.package_store[p].clone(), v))
-                    .collect(),
-            ));
-        };
-        next = highest_priority_pkg;
-        observer.on_event(SolverEvent::PackageChoice {
-            package: &state.package_store[next],
-            allowed: term_intersection,
-        });
-
-        let decision = dependency_provider
-            .choose_version(&state.package_store[next], term_intersection)
-            .map_err(|err| PubGrubError::ErrorChoosingVersion {
-                package: state.package_store[next].clone(),
-                source: err,
-            })?;
-
-        info!(
-            "DP chose: {:?} = '{}' @ {:?}",
-            &next, state.package_store[next], decision
-        );
-
-        // Pick the next compatible version.
-        let v = match decision {
-            None => {
-                observer.on_event(SolverEvent::NoVersion {
-                    package: &state.package_store[next],
-                    allowed: term_intersection,
-                });
-                let inc =
-                    Incompatibility::no_versions(next, Term::Positive(term_intersection.clone()));
-                state.add_incompatibility(inc);
-                continue;
-            }
-            Some(x) => x,
-        };
-        observer.on_event(SolverEvent::VersionChoice {
-            package: &state.package_store[next],
-            version: &v,
-            allowed: term_intersection,
-        });
-
-        if !term_intersection.contains(&v) {
-            panic!(
-                "`choose_version` picked an incompatible version for package {}, {} is not in {}",
-                state.package_store[next], v, term_intersection
-            );
+            return Ok(vec![solution]);
         }
 
-        let is_new_dependency = added_dependencies
-            .entry(next)
-            .or_default()
-            .insert(v.clone());
+        let upgradeable = find_upgradeable_package(
+            dependency_provider,
+            &package,
+            &root_version,
+            &solution,
+            &maximized_packages,
+            &strictly_higher,
+        )?;
 
-        if is_new_dependency {
-            // Retrieve that package dependencies.
-            let p = next;
-            let dependencies = dependency_provider
-                .get_dependencies(&state.package_store[p], &v)
-                .map_err(|err| PubGrubError::ErrorRetrievingDependencies {
-                    package: state.package_store[p].clone(),
-                    version: v.clone(),
-                    source: err,
-                })?;
-
-            let dependencies = match dependencies {
-                Dependencies::Unavailable(reason) => {
-                    state.add_incompatibility(Incompatibility::custom_version(
-                        p,
-                        v.clone(),
-                        reason,
-                    ));
-                    continue;
-                }
-                Dependencies::Available(x) => x,
-            };
-            let incompatibilities = dependency_provider
-                .get_incompatibilities(&state.package_store[p], &v)
-                .map_err(|err| PubGrubError::ErrorRetrievingDependencies {
-                    package: state.package_store[p].clone(),
-                    version: v.clone(),
-                    source: err,
-                })?;
-
-            // Add that package and version if the dependencies are not problematic.
-            match state.add_package_version_dependencies(
-                p,
-                v.clone(),
-                dependencies,
-                incompatibilities,
-            ) {
-                Some(conflict) => {
-                    conflict_tracker.entry(p).or_default().dependencies_affected += 1;
-                    for (incompat_package, _) in state.incompatibility_store[conflict].iter() {
-                        if incompat_package == p {
-                            continue;
-                        }
-                        conflict_tracker
-                            .entry(incompat_package)
-                            .or_default()
-                            .dependencies_culprit += 1;
-                    }
-                }
-                None => observer.on_event(SolverEvent::Decision {
-                    package: &state.package_store[p],
-                    version: &v,
-                    decision_level: state.partial_solution.current_decision_level().0,
-                }),
+        let exclusion = match upgradeable {
+            Some(upgradeable) => solution
+                .iter()
+                .map(|(selected, version)| {
+                    let versions = if selected == &upgradeable {
+                        strictly_higher(version).complement()
+                    } else {
+                        DP::VS::singleton(version.clone())
+                    };
+                    (selected.clone(), Term::Positive(versions))
+                })
+                .collect::<Vec<_>>(),
+            None => {
+                observer.on_event(SolverEvent::Solution);
+                let exclusion = solution
+                    .iter()
+                    .map(|(selected, version)| {
+                        (
+                            selected.clone(),
+                            Term::Positive(DP::VS::singleton(version.clone())),
+                        )
+                    })
+                    .collect();
+                solutions.push(solution);
+                exclusion
             }
-        } else {
-            // `dep_incompats` are already in `incompatibilities` so we know there are not satisfied
-            // terms and can add the decision directly.
-            info!(
-                "add_decision (not first time): {:?} = '{}' @ {}",
-                &next, state.package_store[next], v
-            );
-            state.partial_solution.add_decision(next, v.clone());
-            observer.on_event(SolverEvent::Decision {
-                package: &state.package_store[next],
-                version: &v,
-                decision_level: state.partial_solution.current_decision_level().0,
-            });
+        };
+
+        if !solver.add_solution_exclusion(exclusion) {
+            return Ok(solutions);
         }
     }
+}
+
+fn find_upgradeable_package<DP, F>(
+    dependency_provider: &DP,
+    root_package: &DP::P,
+    root_version: &DP::V,
+    solution: &SelectedDependencies<DP::P, DP::V>,
+    maximized_packages: &[DP::P],
+    strictly_higher: &F,
+) -> Result<Option<DP::P>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    F: Fn(&DP::V) -> DP::VS,
+{
+    for candidate in maximized_packages {
+        let Some(current) = solution.get(candidate) else {
+            continue;
+        };
+        let mut probe = SolverState::new(root_package.clone(), root_version.clone());
+        let root_term = || {
+            (
+                root_package.clone(),
+                Term::Positive(DP::VS::singleton(root_version.clone())),
+            )
+        };
+
+        for (selected, version) in solution.iter() {
+            if selected == root_package || selected == candidate {
+                continue;
+            }
+            probe.add_solution_exclusion([
+                root_term(),
+                (
+                    selected.clone(),
+                    Term::Negative(DP::VS::singleton(version.clone())),
+                ),
+            ]);
+        }
+        probe.add_solution_exclusion([
+            root_term(),
+            (candidate.clone(), Term::Negative(strictly_higher(current))),
+        ]);
+
+        match probe.run_until_solution(dependency_provider, &mut NoopSolverObserver) {
+            Ok(_) => return Ok(Some(candidate.clone())),
+            Err(PubGrubError::NoSolution(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
 }
 
 /// The dependencies of a package with their version ranges.

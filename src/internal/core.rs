@@ -106,6 +106,29 @@ impl<DP: DependencyProvider> State<DP> {
         self.merge_incompatibility(id);
     }
 
+    /// Add a solver-owned clause used to exclude a region already covered by solution
+    /// enumeration. Returns `false` for an empty clause so callers can terminate instead of
+    /// making the whole problem unsatisfiable.
+    pub(crate) fn add_solution_exclusion(
+        &mut self,
+        terms: impl IntoIterator<Item = (DP::P, Term<DP::VS>)>,
+    ) -> bool {
+        let mut package_terms: SmallMap<Id<DP::P>, Term<DP::VS>> = SmallMap::default();
+        for (package, term) in terms {
+            let package = self.package_store.alloc(package);
+            if let Some(existing) = package_terms.get(&package).cloned() {
+                package_terms.insert(package, existing.intersection(&term));
+            } else {
+                package_terms.insert(package, term);
+            }
+        }
+        if package_terms.len() == 0 {
+            return false;
+        }
+        self.add_incompatibility(Incompatibility::excluded_solution(package_terms));
+        true
+    }
+
     /// Add a single custom incompatibility that requires that the base package and the proxy
     /// package share the same version range.
     ///
