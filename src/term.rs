@@ -64,8 +64,11 @@ impl<VS: VersionSet> Term<VS> {
         }
     }
 
-    /// Evaluate a term regarding a given choice of version.
-    pub(crate) fn contains(&self, v: &VS::V) -> bool {
+    /// Whether selecting the given version would satisfy this term.
+    ///
+    /// For a positive term, this checks whether the version is in the contained set.
+    /// For a negative term, this checks whether the version is outside the contained set.
+    pub fn contains(&self, v: &VS::V) -> bool {
         match self {
             Self::Positive(set) => set.contains(v),
             Self::Negative(set) => !set.contains(v),

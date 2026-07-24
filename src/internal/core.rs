@@ -10,7 +10,12 @@ use crate::internal::{
     Arena, DecisionLevel, HashArena, Id, IncompDpId, IncompId, Incompatibility, PartialSolution,
     Relation, SatisfierSearch, SmallVec,
 };
-use crate::{DependencyProvider, DerivationTree, Map, NoSolutionError, VersionSet};
+#[cfg(test)]
+use crate::observer::NoopSolverObserver;
+use crate::{
+    DependencyProvider, DerivationTree, Map, NoSolutionError, SolverEvent, SolverObserver,
+    VersionSet,
+};
 
 /// Current state of the PubGrub algorithm.
 #[derive(Clone)]
@@ -161,12 +166,26 @@ impl<DP: DependencyProvider> State<DP> {
     ///
     /// For each package with a satisfied incompatibility, returns the package and the root cause
     /// incompatibility.
+    #[cfg(test)]
     #[cold]
     #[allow(clippy::type_complexity)] // Type definitions don't support impl trait.
     pub(crate) fn unit_propagation(
         &mut self,
         package: Id<DP::P>,
     ) -> Result<SmallVec<(Id<DP::P>, IncompDpId<DP>)>, NoSolutionError<DP>> {
+        self.unit_propagation_with_observer(package, &mut NoopSolverObserver)
+    }
+
+    #[cold]
+    #[allow(clippy::type_complexity)] // Type definitions don't support impl trait.
+    pub(crate) fn unit_propagation_with_observer<O>(
+        &mut self,
+        package: Id<DP::P>,
+        observer: &mut O,
+    ) -> Result<SmallVec<(Id<DP::P>, IncompDpId<DP>)>, NoSolutionError<DP>>
+    where
+        O: SolverObserver<DP::P, DP::VS, DP::M>,
+    {
         let mut satisfier_causes = SmallVec::default();
         self.unit_propagation_buffer.clear();
         self.unit_propagation_buffer.push(package);
@@ -187,6 +206,10 @@ impl<DP: DependencyProvider> State<DP> {
                     // If the partial solution satisfies the incompatibility
                     // we must perform conflict resolution.
                     Relation::Satisfied => {
+                        if observer.captures_derivation_trees() {
+                            let cause = self.build_derivation_tree(incompat_id);
+                            observer.on_event(SolverEvent::Conflict { cause: &cause });
+                        }
                         log::info!(
                             "Start conflict resolution because incompat satisfied:\n   {}",
                             current_incompat.display(&self.package_store)
@@ -195,6 +218,10 @@ impl<DP: DependencyProvider> State<DP> {
                         break;
                     }
                     Relation::AlmostSatisfied(package_almost) => {
+                        let previous = self
+                            .partial_solution
+                            .term_intersection_for_package(package_almost)
+                            .cloned();
                         // Add `package_almost` to the `unit_propagation_buffer` set.
                         // Putting items in `unit_propagation_buffer` more than once waste cycles,
                         // but so does allocating a hash map and hashing each item.
@@ -208,6 +235,19 @@ impl<DP: DependencyProvider> State<DP> {
                             incompat_id,
                             &self.incompatibility_store,
                         );
+                        if observer.captures_derivation_trees() {
+                            let cause = self.build_derivation_tree(incompat_id);
+                            let current = self
+                                .partial_solution
+                                .term_intersection_for_package(package_almost)
+                                .expect("a derivation was just added");
+                            observer.on_event(SolverEvent::Derivation {
+                                package: &self.package_store[package_almost],
+                                previous: previous.as_ref(),
+                                current,
+                                cause: &cause,
+                            });
+                        }
                         // With the partial solution updated, the incompatibility is now contradicted.
                         self.contradicted_incompatibilities
                             .insert(incompat_id, self.partial_solution.current_decision_level());
@@ -221,18 +261,35 @@ impl<DP: DependencyProvider> State<DP> {
             }
             if let Some(incompat_id) = conflict_id {
                 let (package_almost, root_cause) = self
-                    .conflict_resolution(incompat_id, &mut satisfier_causes)
+                    .conflict_resolution(incompat_id, &mut satisfier_causes, observer)
                     .map_err(|terminal_incompat_id| {
                         self.build_derivation_tree(terminal_incompat_id)
                     })?;
                 self.unit_propagation_buffer.clear();
                 self.unit_propagation_buffer.push(package_almost);
+                let previous = self
+                    .partial_solution
+                    .term_intersection_for_package(package_almost)
+                    .cloned();
                 // Add to the partial solution with incompat as cause.
                 self.partial_solution.add_derivation(
                     package_almost,
                     root_cause,
                     &self.incompatibility_store,
                 );
+                if observer.captures_derivation_trees() {
+                    let cause = self.build_derivation_tree(root_cause);
+                    let current = self
+                        .partial_solution
+                        .term_intersection_for_package(package_almost)
+                        .expect("a derivation was just added");
+                    observer.on_event(SolverEvent::Derivation {
+                        package: &self.package_store[package_almost],
+                        previous: previous.as_ref(),
+                        current,
+                        cause: &cause,
+                    });
+                }
                 // After conflict resolution and the partial solution update,
                 // the root cause incompatibility is now contradicted.
                 self.contradicted_incompatibilities
@@ -275,11 +332,15 @@ impl<DP: DependencyProvider> State<DP> {
     /// that the caller can use them for prioritization.
     #[allow(clippy::type_complexity)]
     #[cold]
-    fn conflict_resolution(
+    fn conflict_resolution<O>(
         &mut self,
         incompatibility: IncompDpId<DP>,
         satisfier_causes: &mut SmallVec<(Id<DP::P>, IncompDpId<DP>)>,
-    ) -> Result<(Id<DP::P>, IncompDpId<DP>), IncompDpId<DP>> {
+        observer: &mut O,
+    ) -> Result<(Id<DP::P>, IncompDpId<DP>), IncompDpId<DP>>
+    where
+        O: SolverObserver<DP::P, DP::VS, DP::M>,
+    {
         let mut current_incompat_id = incompatibility;
         let mut current_incompat_changed = false;
         loop {
@@ -296,11 +357,22 @@ impl<DP: DependencyProvider> State<DP> {
                     SatisfierSearch::DifferentDecisionLevels {
                         previous_satisfier_level,
                     } => {
+                        let from_level = self.partial_solution.current_decision_level().0;
+                        let cause = observer
+                            .captures_derivation_trees()
+                            .then(|| self.build_derivation_tree(current_incompat_id));
                         self.backtrack(
                             current_incompat_id,
                             current_incompat_changed,
                             previous_satisfier_level,
                         );
+                        if let Some(cause) = cause {
+                            observer.on_event(SolverEvent::Backtrack {
+                                from_level,
+                                to_level: previous_satisfier_level.0,
+                                cause: &cause,
+                            });
+                        }
                         log::info!("backtrack to {previous_satisfier_level:?}");
                         satisfier_causes.push((package, current_incompat_id));
                         return Ok((package, current_incompat_id));

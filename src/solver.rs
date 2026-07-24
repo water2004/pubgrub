@@ -175,7 +175,7 @@ where
             "unit_propagation: {:?} = '{}'",
             &next, state.package_store[next]
         );
-        let satisfier_causes = state.unit_propagation(next)?;
+        let satisfier_causes = state.unit_propagation_with_observer(next, observer)?;
         for (affected, incompat) in satisfier_causes {
             conflict_tracker
                 .entry(affected)
