@@ -213,6 +213,7 @@
 #![warn(missing_docs)]
 
 mod error;
+mod observer;
 mod package;
 mod provider;
 mod report;
@@ -223,6 +224,7 @@ mod version;
 mod version_set;
 
 pub use error::{NoSolutionError, PubGrubError};
+pub use observer::{SolverEvent, SolverObserver};
 pub use package::Package;
 pub use provider::OfflineDependencyProvider;
 pub use report::{
@@ -231,7 +233,7 @@ pub use report::{
 };
 pub use solver::{
     Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics,
-    SelectedDependencies, resolve,
+    SelectedDependencies, resolve, resolve_with_observer,
 };
 pub use term::Term;
 pub use type_aliases::{Map, Set};

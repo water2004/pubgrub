@@ -5,7 +5,8 @@ use std::error::Error;
 use std::fmt::{Debug, Display};
 
 use crate::internal::{Id, Incompatibility, State};
-use crate::{Map, Package, PubGrubError, Term, VersionSet};
+use crate::observer::NoopSolverObserver;
+use crate::{Map, Package, PubGrubError, SolverEvent, SolverObserver, Term, VersionSet};
 use log::{debug, info};
 
 /// Statistics on how often a package conflicted with other packages.
@@ -137,6 +138,30 @@ pub fn resolve<DP: DependencyProvider>(
     package: DP::P,
     version: impl Into<DP::V>,
 ) -> Result<SelectedDependencies<DP::P, DP::V>, PubGrubError<DP>> {
+    resolve_with_observer(
+        dependency_provider,
+        package,
+        version,
+        &mut NoopSolverObserver,
+    )
+}
+
+/// Finds a set of packages satisfying dependency bounds and reports the path taken by the solver.
+///
+/// Unlike the derivation tree returned for an unsatisfiable resolution, observer events describe
+/// one concrete solver run. In particular, they can explain when a version was excluded by
+/// propagation or discarded by backtracking even if a different solver path could select it.
+#[cold]
+pub fn resolve_with_observer<DP, O>(
+    dependency_provider: &DP,
+    package: DP::P,
+    version: impl Into<DP::V>,
+    observer: &mut O,
+) -> Result<SelectedDependencies<DP::P, DP::V>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    O: SolverObserver<DP::P, DP::VS, DP::M>,
+{
     let mut state: State<DP> = State::init(package.clone(), version.into());
     let mut conflict_tracker: Map<Id<DP::P>, PackageResolutionStatistics> = Map::default();
     let mut added_dependencies: Map<Id<DP::P>, Set<DP::V>> = Map::default();
@@ -181,6 +206,7 @@ pub fn resolve<DP: DependencyProvider>(
                 )
             })
         else {
+            observer.on_event(SolverEvent::Solution);
             return Ok(SelectedDependencies(
                 state
                     .partial_solution
@@ -190,6 +216,10 @@ pub fn resolve<DP: DependencyProvider>(
             ));
         };
         next = highest_priority_pkg;
+        observer.on_event(SolverEvent::PackageChoice {
+            package: &state.package_store[next],
+            allowed: term_intersection,
+        });
 
         let decision = dependency_provider
             .choose_version(&state.package_store[next], term_intersection)
@@ -206,6 +236,10 @@ pub fn resolve<DP: DependencyProvider>(
         // Pick the next compatible version.
         let v = match decision {
             None => {
+                observer.on_event(SolverEvent::NoVersion {
+                    package: &state.package_store[next],
+                    allowed: term_intersection,
+                });
                 let inc =
                     Incompatibility::no_versions(next, Term::Positive(term_intersection.clone()));
                 state.add_incompatibility(inc);
@@ -213,6 +247,11 @@ pub fn resolve<DP: DependencyProvider>(
             }
             Some(x) => x,
         };
+        observer.on_event(SolverEvent::VersionChoice {
+            package: &state.package_store[next],
+            version: &v,
+            allowed: term_intersection,
+        });
 
         if !term_intersection.contains(&v) {
             panic!(
