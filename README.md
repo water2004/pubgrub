@@ -76,6 +76,25 @@ Two examples from uv:
     And because your workspace requires dummy[extra2] and dummysub[extra1], we can conclude that your workspace's requirements are unsatisfiable.
 ```
 
+## Explaining a successful resolution
+
+An unsatisfiable derivation tree proves that no solution exists. It does not
+explain why one particular version was skipped in a successful resolution.
+Use `resolve_with_observer` when that distinction matters. Its typed events
+describe the actual path taken by the solver:
+
+- `VersionChoice` records a version proposed by the dependency provider.
+- `Decision` records that the proposal was committed to the partial solution.
+- `Derivation` records when propagation narrowed a package's allowed versions.
+- `Conflict` and `Backtrack` retain the incompatibility trees used by conflict
+  resolution.
+
+`Term::contains` lets an observer detect the exact derivation that changed a
+target version from allowed to excluded. The event's derivation tree can then
+be cloned and rendered with application-specific package names and messages,
+without parsing logs or running a second counterfactual solve. See the runnable
+[`explain_version`](./examples/explain_version.rs) example.
+
 ## Contributing
 
 Discussion and development happens here on GitHub and on our

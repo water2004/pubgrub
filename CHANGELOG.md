@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- Add `resolve_with_observer`, `SolverObserver`, and typed solver events for inspecting the
+  decisions, derivations, conflicts, and backtracks of a successful or failed solver run.
+- Add `Term::contains` for checking whether a derivation allows a specific version.
+
 ## 0.4.0 - 2026-04-09
 
 ### Breaking

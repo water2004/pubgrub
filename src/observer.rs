@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Observe the decisions and derivations made during dependency resolution.
+//!
+//! These events expose the actual path taken by the solver. This makes it possible to explain why
+//! a version was skipped in a successful resolution, where an unsatisfiable derivation tree from a
+//! separate counterfactual solve would answer a different question.
+//!
+//! [`SolverEvent::VersionChoice`] is a proposal made by the dependency provider, while
+//! [`SolverEvent::Decision`] means that proposal was committed to the partial solution. A committed
+//! decision may later be discarded by [`SolverEvent::Backtrack`]. For a version that was never
+//! proposed, compare [`SolverEvent::Derivation::previous`] and
+//! [`SolverEvent::Derivation::current`] with [`Term::contains`](crate::Term::contains) to find the
+//! propagation step that excluded it.
 
 use std::fmt::{Debug, Display};
 
