@@ -289,19 +289,24 @@ where
             };
 
             // Add that package and version if the dependencies are not problematic.
-            if let Some(conflict) =
-                state.add_package_version_dependencies(p, v.clone(), dependencies)
-            {
-                conflict_tracker.entry(p).or_default().dependencies_affected += 1;
-                for (incompat_package, _) in state.incompatibility_store[conflict].iter() {
-                    if incompat_package == p {
-                        continue;
+            match state.add_package_version_dependencies(p, v.clone(), dependencies) {
+                Some(conflict) => {
+                    conflict_tracker.entry(p).or_default().dependencies_affected += 1;
+                    for (incompat_package, _) in state.incompatibility_store[conflict].iter() {
+                        if incompat_package == p {
+                            continue;
+                        }
+                        conflict_tracker
+                            .entry(incompat_package)
+                            .or_default()
+                            .dependencies_culprit += 1;
                     }
-                    conflict_tracker
-                        .entry(incompat_package)
-                        .or_default()
-                        .dependencies_culprit += 1;
                 }
+                None => observer.on_event(SolverEvent::Decision {
+                    package: &state.package_store[p],
+                    version: &v,
+                    decision_level: state.partial_solution.current_decision_level().0,
+                }),
             }
         } else {
             // `dep_incompats` are already in `incompatibilities` so we know there are not satisfied
@@ -310,7 +315,12 @@ where
                 "add_decision (not first time): {:?} = '{}' @ {}",
                 &next, state.package_store[next], v
             );
-            state.partial_solution.add_decision(next, v);
+            state.partial_solution.add_decision(next, v.clone());
+            observer.on_event(SolverEvent::Decision {
+                package: &state.package_store[next],
+                version: &v,
+                decision_level: state.partial_solution.current_decision_level().0,
+            });
         }
     }
 }

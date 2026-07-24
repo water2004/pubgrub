@@ -34,6 +34,15 @@ where
         /// Versions allowed when the selection was made.
         allowed: &'a VS,
     },
+    /// The solver committed a package version to the partial solution.
+    Decision {
+        /// Package whose version was committed.
+        package: &'a P,
+        /// Version committed to the partial solution.
+        version: &'a VS::V,
+        /// Decision level assigned to the package version.
+        decision_level: u32,
+    },
     /// The dependency provider found no version in the currently allowed set.
     NoVersion {
         /// Package for which no version was found.

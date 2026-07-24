@@ -7,6 +7,7 @@ use pubgrub::{
 enum RecordedEvent {
     PackageChoice(String),
     VersionChoice(String, u32),
+    Decision(String, u32, u32),
     NoVersion(String),
     Derivation {
         package: String,
@@ -49,6 +50,15 @@ impl SolverObserver<&'static str, Ranges<u32>, String> for Recorder {
             } => self.events.push(RecordedEvent::VersionChoice(
                 (*package).to_string(),
                 *version,
+            )),
+            SolverEvent::Decision {
+                package,
+                version,
+                decision_level,
+            } => self.events.push(RecordedEvent::Decision(
+                (*package).to_string(),
+                *version,
+                decision_level,
             )),
             SolverEvent::NoVersion { package, .. } => self
                 .events
@@ -154,6 +164,16 @@ fn observer_retains_the_actual_reason_a_newer_version_was_discarded() {
             .events
             .contains(&RecordedEvent::VersionChoice("a".to_string(), 2))
     );
+    let a_two_decision_level = recorder
+        .events
+        .iter()
+        .find_map(|event| match event {
+            RecordedEvent::Decision(package, 2, decision_level) if package == "a" => {
+                Some(*decision_level)
+            }
+            _ => None,
+        })
+        .expect("a 2 was committed before it was backtracked");
     assert!(recorder.events.iter().any(|event| {
         matches!(
             event,
@@ -162,6 +182,8 @@ fn observer_retains_the_actual_reason_a_newer_version_was_discarded() {
                 to_level,
                 packages,
             } if from_level > to_level
+                && a_two_decision_level > *to_level
+                && a_two_decision_level <= *from_level
                 && packages == &["a".to_string(), "b".to_string()]
         )
     }));
@@ -195,6 +217,12 @@ fn observer_explains_a_version_excluded_before_it_was_chosen() {
         !recorder
             .events
             .contains(&RecordedEvent::VersionChoice("a".to_string(), 2))
+    );
+    assert!(
+        !recorder
+            .events
+            .iter()
+            .any(|event| matches!(event, RecordedEvent::Decision(package, 2, _) if package == "a"))
     );
     assert!(recorder.events.iter().any(|event| {
         matches!(
