@@ -29,6 +29,26 @@ struct Recorder {
     events: Vec<RecordedEvent>,
 }
 
+struct ChoicesOnly;
+
+impl SolverObserver<&'static str, Ranges<u32>, String> for ChoicesOnly {
+    fn on_event(&mut self, event: SolverEvent<'_, &'static str, Ranges<u32>, String>) {
+        assert!(
+            !matches!(
+                event,
+                SolverEvent::Derivation { .. }
+                    | SolverEvent::Conflict { .. }
+                    | SolverEvent::Backtrack { .. }
+            ),
+            "cause events should not be emitted when derivation capture is disabled"
+        );
+    }
+
+    fn captures_derivation_trees(&self) -> bool {
+        false
+    }
+}
+
 fn cause_packages(cause: &DerivationTree<&'static str, Ranges<u32>, String>) -> Vec<String> {
     let mut packages: Vec<_> = cause
         .packages()
@@ -236,4 +256,21 @@ fn observer_explains_a_version_excluded_before_it_was_chosen() {
                 && packages == &["a".to_string(), "b".to_string()]
         )
     }));
+}
+
+#[test]
+fn observer_can_disable_derivation_tree_capture() {
+    let mut provider = OfflineDependencyProvider::<&str, Ranges<u32>>::new();
+    provider.add_dependencies(
+        "root",
+        1u32,
+        [("a", Ranges::full()), ("b", Ranges::singleton(1u32))],
+    );
+    provider.add_dependencies("a", 2u32, [("b", Ranges::singleton(2u32))]);
+    provider.add_dependencies("a", 1u32, [("b", Ranges::singleton(1u32))]);
+    provider.add_dependencies("b", 2u32, []);
+    provider.add_dependencies("b", 1u32, []);
+
+    let solution = resolve_with_observer(&provider, "root", 1u32, &mut ChoicesOnly).unwrap();
+    assert_eq!(solution.get(&"a"), Some(&1));
 }

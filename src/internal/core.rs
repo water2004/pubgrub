@@ -218,10 +218,14 @@ impl<DP: DependencyProvider> State<DP> {
                         break;
                     }
                     Relation::AlmostSatisfied(package_almost) => {
-                        let previous = self
-                            .partial_solution
-                            .term_intersection_for_package(package_almost)
-                            .cloned();
+                        let capture_derivation = observer.captures_derivation_trees();
+                        let previous = if capture_derivation {
+                            self.partial_solution
+                                .term_intersection_for_package(package_almost)
+                                .cloned()
+                        } else {
+                            None
+                        };
                         // Add `package_almost` to the `unit_propagation_buffer` set.
                         // Putting items in `unit_propagation_buffer` more than once waste cycles,
                         // but so does allocating a hash map and hashing each item.
@@ -235,7 +239,7 @@ impl<DP: DependencyProvider> State<DP> {
                             incompat_id,
                             &self.incompatibility_store,
                         );
-                        if observer.captures_derivation_trees() {
+                        if capture_derivation {
                             let cause = self.build_derivation_tree(incompat_id);
                             let current = self
                                 .partial_solution
@@ -267,17 +271,21 @@ impl<DP: DependencyProvider> State<DP> {
                     })?;
                 self.unit_propagation_buffer.clear();
                 self.unit_propagation_buffer.push(package_almost);
-                let previous = self
-                    .partial_solution
-                    .term_intersection_for_package(package_almost)
-                    .cloned();
+                let capture_derivation = observer.captures_derivation_trees();
+                let previous = if capture_derivation {
+                    self.partial_solution
+                        .term_intersection_for_package(package_almost)
+                        .cloned()
+                } else {
+                    None
+                };
                 // Add to the partial solution with incompat as cause.
                 self.partial_solution.add_derivation(
                     package_almost,
                     root_cause,
                     &self.incompatibility_store,
                 );
-                if observer.captures_derivation_trees() {
+                if capture_derivation {
                     let cause = self.build_derivation_tree(root_cause);
                     let current = self
                         .partial_solution
