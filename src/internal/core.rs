@@ -107,12 +107,13 @@ impl<DP: DependencyProvider> State<DP> {
     }
 
     /// Add a solver-owned clause used to exclude a region already covered by solution
-    /// enumeration. Returns `false` for an empty clause so callers can terminate instead of
+    /// enumeration. Returns one involved package to seed propagation, or `None` for an empty
+    /// clause so callers can terminate instead of
     /// making the whole problem unsatisfiable.
     pub(crate) fn add_solution_exclusion(
         &mut self,
         terms: impl IntoIterator<Item = (DP::P, Term<DP::VS>)>,
-    ) -> bool {
+    ) -> Option<Id<DP::P>> {
         let mut package_terms: SmallMap<Id<DP::P>, Term<DP::VS>> = SmallMap::default();
         for (package, term) in terms {
             let package = self.package_store.alloc(package);
@@ -123,10 +124,15 @@ impl<DP: DependencyProvider> State<DP> {
             }
         }
         if package_terms.len() == 0 {
-            return false;
+            return None;
         }
+        let next = package_terms
+            .iter()
+            .next()
+            .map(|(&package, _)| package)
+            .expect("a non-empty exclusion must contain a package");
         self.add_incompatibility(Incompatibility::excluded_solution(package_terms));
-        true
+        Some(next)
     }
 
     /// Add a single custom incompatibility that requires that the base package and the proxy

@@ -104,3 +104,21 @@ fn observer_reports_only_retained_solutions() {
     assert_eq!(projected(solutions), BTreeSet::from([(2, 2)]));
     assert_eq!(observer.0, 1);
 }
+
+#[test]
+fn packages_outside_the_projection_may_change_during_an_upgrade() {
+    let mut provider = Provider::new();
+    provider.add_dependencies("root", 1u32, [("a", Ranges::full())]);
+    provider.add_dependencies("a", 1u32, [("internal-old", Ranges::singleton(1u32))]);
+    provider.add_dependencies("a", 2u32, [("internal-new", Ranges::singleton(1u32))]);
+    provider.add_dependencies("internal-old", 1u32, []);
+    provider.add_dependencies("internal-new", 1u32, []);
+
+    let solutions = resolve_maximal_solutions(&provider, "root", 1u32, ["a"], |version| {
+        Ranges::strictly_higher_than(*version)
+    })
+    .unwrap();
+
+    assert_eq!(solutions.len(), 1);
+    assert_eq!(solutions[0].get(&"a"), Some(&2));
+}

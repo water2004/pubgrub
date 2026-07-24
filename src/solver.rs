@@ -105,11 +105,11 @@ impl<DP: DependencyProvider> SolverState<DP> {
         &mut self,
         terms: impl IntoIterator<Item = (DP::P, Term<DP::VS>)>,
     ) -> bool {
-        let added = self.state.add_solution_exclusion(terms);
-        if added {
-            self.next = self.state.root_package;
-        }
-        added
+        let Some(next) = self.state.add_solution_exclusion(terms) else {
+            return false;
+        };
+        self.next = next;
+        true
     }
 
     fn run_until_solution<O>(
@@ -396,8 +396,9 @@ where
 /// package versions remain fixed.
 ///
 /// `strictly_higher` must return the version set strictly greater than its argument. The package
-/// iterator controls which packages are considered upgrade targets; all selected packages,
-/// including transitive dependencies, are held fixed while checking an individual upgrade.
+/// iterator defines both the user-visible solution coordinates and the packages considered for
+/// upgrades. Other coordinates are held fixed while checking an individual upgrade; packages
+/// outside that projection may change and do not make two projected solutions distinct.
 ///
 /// Enumeration may be exponential in the number of independent choices. The dependency
 /// provider's [`should_cancel`](DependencyProvider::should_cancel) hook remains active throughout
@@ -483,6 +484,7 @@ where
         let exclusion = match upgradeable {
             Some(upgradeable) => solution
                 .iter()
+                .filter(|(selected, _)| maximized_packages.contains(selected))
                 .map(|(selected, version)| {
                     let versions = if selected == &upgradeable {
                         strictly_higher(version).complement()
@@ -496,6 +498,7 @@ where
                 observer.on_event(SolverEvent::Solution);
                 let exclusion = solution
                     .iter()
+                    .filter(|(selected, _)| maximized_packages.contains(selected))
                     .map(|(selected, version)| {
                         (
                             selected.clone(),
@@ -539,7 +542,10 @@ where
         };
 
         for (selected, version) in solution.iter() {
-            if selected == root_package || selected == candidate {
+            if selected == root_package
+                || selected == candidate
+                || !maximized_packages.contains(selected)
+            {
                 continue;
             }
             probe.add_solution_exclusion([

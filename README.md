@@ -98,10 +98,12 @@ without parsing logs or running a second counterfactual solve. See the runnable
 ## Enumerating locally maximal solutions
 
 `resolve_maximal_solutions` enumerates every solution in which none of the
-requested packages can be upgraded while every other selected package version
-stays fixed. This is deliberately different from returning every legal version
-combination: dominated combinations are classified and pruned inside the
-solver.
+requested packages can be upgraded while every other requested package version
+stays fixed. The requested package list is also the solution projection:
+solver-internal or otherwise unlisted packages may change and do not create a
+distinct result. This is deliberately different from returning every legal
+version combination: dominated combinations are classified and pruned inside
+the solver.
 
 Use `resolve_maximal_solutions_with_observer` when the application also needs
 the real derivation path for each result. It continues one solver session,
