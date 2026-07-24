@@ -72,6 +72,8 @@ enum Kind<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> {
     /// * The version would require building the package, but builds are disabled.
     /// * The package is not available in the cache, but internet access has been disabled.
     Custom(Id<P>, VS, M),
+    /// A provider-supplied conditional incompatibility.
+    CustomClause(M),
 }
 
 /// A Relation describes how a set of terms can be compared to an incompatibility.
@@ -135,6 +137,13 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Incompatibilit
         Self {
             package_terms: SmallMap::One([(package, term)]),
             kind: Kind::Custom(package, set, metadata),
+        }
+    }
+
+    pub(crate) fn custom_clause(package_terms: SmallMap<Id<P>, Term<VS>>, metadata: M) -> Self {
+        Self {
+            package_terms,
+            kind: Kind::CustomClause(metadata),
         }
     }
 
@@ -318,6 +327,14 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Incompatibilit
                 set.clone(),
                 metadata.clone(),
             )),
+            Kind::CustomClause(metadata) => DerivationTree::External(External::CustomClause {
+                terms: store[self_id]
+                    .package_terms
+                    .iter()
+                    .map(|(&package, term)| (package_store[package].clone(), term.clone()))
+                    .collect(),
+                metadata: metadata.clone(),
+            }),
         }
     }
 }
@@ -472,6 +489,7 @@ pub(crate) mod tests {
                 state.root_package,
                 0,
                 [("foo".to_string(), Ranges::singleton(1usize))],
+                [],
             );
             state.unit_propagation(state.root_package).unwrap();
 
@@ -480,7 +498,7 @@ pub(crate) mod tests {
                 .partial_solution
                 .pick_highest_priority_pkg(|_p, _r| (0, Reverse(0)))
                 .unwrap();
-            state.add_package_version_dependencies(next, 1, case.clone());
+            state.add_package_version_dependencies(next, 1, case.clone(), []);
             state.unit_propagation(next).unwrap();
 
             assert!(

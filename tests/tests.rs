@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use pubgrub::{
-    Dependencies, DependencyProvider, OfflineDependencyProvider, Package,
-    PackageResolutionStatistics, PubGrubError, Ranges, VersionSet, resolve,
+    DefaultStringReporter, Dependencies, DependencyProvider, IncompatibilityConstraint,
+    IncompatibilityConstraintTerm, IncompatibilityConstraints, OfflineDependencyProvider, Package,
+    PackageResolutionStatistics, PubGrubError, Ranges, Reporter as _, VersionSet, resolve,
 };
+use std::collections::HashMap;
 use std::convert::Infallible;
 
 type NumVS = Ranges<u32>;
@@ -133,4 +135,121 @@ fn same_result_across_platforms() {
     let resolution = resolve(&dependency_provider, name, ver).unwrap();
     let (p, _v) = resolution.into_iter().find(|(_p, v)| *v == 2).unwrap();
     assert_eq!(p, "0".to_string());
+}
+
+type ClauseMap =
+    HashMap<(&'static str, u32), IncompatibilityConstraints<&'static str, NumVS, String>>;
+
+struct ClauseProvider {
+    packages: OfflineDependencyProvider<&'static str, NumVS>,
+    clauses: ClauseMap,
+}
+
+impl Default for ClauseProvider {
+    fn default() -> Self {
+        Self {
+            packages: OfflineDependencyProvider::new(),
+            clauses: HashMap::new(),
+        }
+    }
+}
+
+impl DependencyProvider for ClauseProvider {
+    type P = &'static str;
+    type V = u32;
+    type VS = NumVS;
+    type M = String;
+    type Priority = (u32, std::cmp::Reverse<usize>);
+    type Err = Infallible;
+
+    fn choose_version(
+        &self,
+        package: &Self::P,
+        range: &Self::VS,
+    ) -> Result<Option<Self::V>, Self::Err> {
+        self.packages.choose_version(package, range)
+    }
+
+    fn prioritize(
+        &self,
+        package: &Self::P,
+        range: &Self::VS,
+        statistics: &PackageResolutionStatistics,
+    ) -> Self::Priority {
+        self.packages.prioritize(package, range, statistics)
+    }
+
+    fn get_dependencies(
+        &self,
+        package: &Self::P,
+        version: &Self::V,
+    ) -> Result<Dependencies<Self::P, Self::VS, Self::M>, Self::Err> {
+        self.packages.get_dependencies(package, version)
+    }
+
+    fn get_incompatibilities(
+        &self,
+        package: &Self::P,
+        version: &Self::V,
+    ) -> Result<Vec<IncompatibilityConstraint<Self::P, Self::VS, Self::M>>, Self::Err> {
+        Ok(self
+            .clauses
+            .get(&(*package, *version))
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
+#[test]
+fn provider_clauses_participate_in_the_original_derivation() {
+    let mut provider = ClauseProvider::default();
+    provider.packages.add_dependencies(
+        "root",
+        1_u32,
+        [
+            ("a", Ranges::singleton(1_u32)),
+            ("b", Ranges::singleton(1_u32)),
+        ],
+    );
+    provider.packages.add_dependencies("a", 1_u32, []);
+    provider.packages.add_dependencies("b", 1_u32, []);
+    provider.clauses.insert(
+        ("a", 1),
+        vec![IncompatibilityConstraint {
+            terms: vec![IncompatibilityConstraintTerm::Positive(
+                "b",
+                Ranges::singleton(1_u32),
+            )],
+            reason: "a 1 cannot coexist with b 1".to_string(),
+        }],
+    );
+
+    let error = resolve(&provider, "root", 1_u32).unwrap_err();
+    let PubGrubError::NoSolution(tree) = error;
+
+    assert!(DefaultStringReporter::report(&tree).contains("a 1 cannot coexist with b 1"));
+}
+
+#[test]
+fn provider_clause_negative_terms_support_conditional_requirements() {
+    let mut provider = ClauseProvider::default();
+    provider
+        .packages
+        .add_dependencies("root", 1_u32, [("a", Ranges::singleton(1_u32))]);
+    provider.packages.add_dependencies("a", 1_u32, []);
+    provider.packages.add_dependencies("b", 1_u32, []);
+    provider.clauses.insert(
+        ("a", 1),
+        vec![IncompatibilityConstraint {
+            terms: vec![IncompatibilityConstraintTerm::Negative(
+                "b",
+                Ranges::singleton(1_u32),
+            )],
+            reason: "a 1 requires b 1".to_string(),
+        }],
+    );
+
+    let resolution = resolve(&provider, "root", 1_u32).unwrap();
+
+    assert_eq!(resolution.get(&"b"), Some(&1));
 }

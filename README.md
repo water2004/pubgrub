@@ -95,6 +95,26 @@ be cloned and rendered with application-specific package names and messages,
 without parsing logs or running a second counterfactual solve. See the runnable
 [`explain_version`](./examples/explain_version.rs) example.
 
+## Provider-defined incompatibilities
+
+Some package metadata cannot be represented as a list of ordinary dependency
+edges. A provider can return conditional clauses from
+`DependencyProvider::get_incompatibilities`:
+
+```rust
+IncompatibilityConstraint {
+    terms: vec![IncompatibilityConstraintTerm::Positive(other, versions)],
+    reason: MyReason::Conflict,
+}
+```
+
+The selected declaring package/version is inserted as a positive term
+automatically. Positive terms express combinations that cannot coexist;
+negative terms express conditional requirements. These clauses are added to
+the active solver state when the declaring version is chosen, so their
+metadata is retained in conflict learning and the original derivation tree.
+They are not a post-processing explanation pass.
+
 ## Contributing
 
 Discussion and development happens here on GitHub and on our

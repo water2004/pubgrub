@@ -47,6 +47,9 @@ fn print_external_facts(cause: &Cause) {
             External::Custom(package, versions, message) => {
                 println!("  {package} {versions} is unavailable: {message}");
             }
+            External::CustomClause { metadata, .. } => {
+                println!("  {metadata}");
+            }
         },
         DerivationTree::Derived(derived) => {
             print_external_facts(&derived.cause1);

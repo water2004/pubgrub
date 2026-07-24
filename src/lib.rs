@@ -232,7 +232,8 @@ pub use report::{
     ReportFormatter, Reporter,
 };
 pub use solver::{
-    Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics,
+    Dependencies, DependencyConstraints, DependencyProvider, IncompatibilityConstraint,
+    IncompatibilityConstraintTerm, IncompatibilityConstraints, PackageResolutionStatistics,
     SelectedDependencies, resolve, resolve_with_observer,
 };
 pub use term::Term;

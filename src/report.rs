@@ -46,6 +46,13 @@ pub enum External<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> {
     FromDependencyOf(P, VS, P, VS),
     /// The package is unusable for reasons outside pubgrub.
     Custom(P, VS, M),
+    /// A provider-supplied incompatibility with arbitrary terms.
+    CustomClause {
+        /// Terms that must not all hold at the same time.
+        terms: Map<P, Term<VS>>,
+        /// Human-readable reason supplied by the dependency provider.
+        metadata: M,
+    },
 }
 
 /// Incompatibility derived from two others.
@@ -78,6 +85,9 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> DerivationTree
                 | External::NotRoot(p, _)
                 | External::Custom(p, _, _) => {
                     packages.insert(p);
+                }
+                External::CustomClause { terms, .. } => {
+                    packages.extend(terms.keys());
                 }
             },
             Self::Derived(derived) => {
@@ -160,6 +170,7 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> DerivationTree
             }
             // Cannot be merged because the reason may not match
             DerivationTree::External(External::Custom(_, _, _)) => None,
+            DerivationTree::External(External::CustomClause { .. }) => None,
         }
     }
 }
@@ -187,6 +198,7 @@ impl<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Display> Display for Ex
                     )
                 }
             }
+            Self::CustomClause { metadata, .. } => write!(f, "{metadata}"),
             Self::FromDependencyOf(p, set_p, dep, set_dep) => {
                 if set_p == &VS::full() && set_dep == &VS::full() {
                     write!(f, "{p} depends on {dep}")

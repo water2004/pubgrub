@@ -287,9 +287,21 @@ where
                 }
                 Dependencies::Available(x) => x,
             };
+            let incompatibilities = dependency_provider
+                .get_incompatibilities(&state.package_store[p], &v)
+                .map_err(|err| PubGrubError::ErrorRetrievingDependencies {
+                    package: state.package_store[p].clone(),
+                    version: v.clone(),
+                    source: err,
+                })?;
 
             // Add that package and version if the dependencies are not problematic.
-            match state.add_package_version_dependencies(p, v.clone(), dependencies) {
+            match state.add_package_version_dependencies(
+                p,
+                v.clone(),
+                dependencies,
+                incompatibilities,
+            ) {
                 Some(conflict) => {
                     conflict_tracker.entry(p).or_default().dependencies_affected += 1;
                     for (incompat_package, _) in state.incompatibility_store[conflict].iter() {
@@ -333,6 +345,31 @@ where
 /// while the latter means they could not be fetched by the [DependencyProvider].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyConstraints<P, VS>(Vec<(P, VS)>);
+
+/// One term in a provider-supplied incompatibility clause.
+///
+/// A positive term is true only when the package is selected in the given
+/// range. A negative term is also true when the package is not selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncompatibilityConstraintTerm<P, VS> {
+    /// The package must be selected in the given range for the term to hold.
+    Positive(P, VS),
+    /// The term holds when the package is absent or outside the given range.
+    Negative(P, VS),
+}
+
+/// A clause that must not be satisfied together with the package version whose
+/// metadata returned it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompatibilityConstraint<P, VS, M> {
+    /// Additional terms; the declaring package/version is inserted automatically.
+    pub terms: Vec<IncompatibilityConstraintTerm<P, VS>>,
+    /// Human-readable reason retained in derivation reports.
+    pub reason: M,
+}
+
+/// Provider-supplied incompatibility clauses for one package version.
+pub type IncompatibilityConstraints<P, VS, M> = Vec<IncompatibilityConstraint<P, VS, M>>;
 
 /// Backwards compatibility: Serialize as map.
 #[cfg(feature = "serde")]
@@ -483,6 +520,18 @@ pub trait DependencyProvider {
         package: &Self::P,
         version: &Self::V,
     ) -> Result<Dependencies<Self::P, Self::VS, Self::M>, Self::Err>;
+
+    /// Retrieves conditional incompatibilities declared by this package
+    /// version. The current package/version is automatically included as a
+    /// positive term in every returned clause.
+    #[allow(clippy::type_complexity)]
+    fn get_incompatibilities(
+        &self,
+        _package: &Self::P,
+        _version: &Self::V,
+    ) -> Result<IncompatibilityConstraints<Self::P, Self::VS, Self::M>, Self::Err> {
+        Ok(Vec::new())
+    }
 
     /// This is called fairly regularly during the resolution,
     /// if it returns an Err then resolution will be terminated.

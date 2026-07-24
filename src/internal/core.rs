@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use crate::internal::{
     Arena, DecisionLevel, HashArena, Id, IncompDpId, IncompId, Incompatibility, PartialSolution,
-    Relation, SatisfierSearch, SmallVec,
+    Relation, SatisfierSearch, SmallMap, SmallVec,
 };
 #[cfg(test)]
 use crate::observer::NoopSolverObserver;
 use crate::{
-    DependencyProvider, DerivationTree, Map, NoSolutionError, SolverEvent, SolverObserver,
-    VersionSet,
+    DependencyProvider, DerivationTree, IncompatibilityConstraint, IncompatibilityConstraintTerm,
+    Map, NoSolutionError, SolverEvent, SolverObserver, Term, VersionSet,
 };
 
 /// Current state of the PubGrub algorithm.
@@ -84,9 +84,14 @@ impl<DP: DependencyProvider> State<DP> {
         package: Id<DP::P>,
         version: DP::V,
         dependencies: impl IntoIterator<Item = (DP::P, DP::VS)>,
+        clauses: impl IntoIterator<Item = IncompatibilityConstraint<DP::P, DP::VS, DP::M>>,
     ) -> Option<IncompId<DP::P, DP::VS, DP::M>> {
-        let dep_incompats =
-            self.add_incompatibility_from_dependencies(package, version.clone(), dependencies);
+        let dep_incompats = self.add_incompatibility_from_constraints(
+            package,
+            version.clone(),
+            dependencies,
+            clauses,
+        );
         self.partial_solution.add_package_version_incompatibilities(
             package,
             version.clone(),
@@ -137,23 +142,50 @@ impl<DP: DependencyProvider> State<DP> {
 
     /// Add an incompatibility to the state.
     #[cold]
-    pub(crate) fn add_incompatibility_from_dependencies(
+    pub(crate) fn add_incompatibility_from_constraints(
         &mut self,
         package: Id<DP::P>,
         version: DP::V,
         deps: impl IntoIterator<Item = (DP::P, DP::VS)>,
+        clauses: impl IntoIterator<Item = IncompatibilityConstraint<DP::P, DP::VS, DP::M>>,
     ) -> std::ops::Range<IncompDpId<DP>> {
+        let package_version = <DP::VS as VersionSet>::singleton(version.clone());
+        let mut incompatibilities = deps
+            .into_iter()
+            .map(|(dep_p, dep_vs)| {
+                let dep_pid = self.package_store.alloc(dep_p);
+                Incompatibility::from_dependency(
+                    package,
+                    package_version.clone(),
+                    (dep_pid, dep_vs),
+                )
+            })
+            .collect::<Vec<_>>();
+        incompatibilities.extend(clauses.into_iter().map(|clause| {
+            let mut terms = SmallMap::default();
+            terms.insert(package, Term::Positive(package_version.clone()));
+            for term in clause.terms {
+                let (dependency, term) = match term {
+                    IncompatibilityConstraintTerm::Positive(dependency, versions) => {
+                        (dependency, Term::Positive(versions))
+                    }
+                    IncompatibilityConstraintTerm::Negative(dependency, versions) => {
+                        (dependency, Term::Negative(versions))
+                    }
+                };
+                let dependency = self.package_store.alloc(dependency);
+                if let Some(existing) = terms.get(&dependency).cloned() {
+                    terms.insert(dependency, existing.intersection(&term));
+                } else {
+                    terms.insert(dependency, term);
+                }
+            }
+            Incompatibility::custom_clause(terms, clause.reason)
+        }));
         // Create incompatibilities and allocate them in the store.
-        let new_incompats_id_range =
-            self.incompatibility_store
-                .alloc_iter(deps.into_iter().map(|(dep_p, dep_vs)| {
-                    let dep_pid = self.package_store.alloc(dep_p);
-                    Incompatibility::from_dependency(
-                        package,
-                        <DP::VS as VersionSet>::singleton(version.clone()),
-                        (dep_pid, dep_vs),
-                    )
-                }));
+        let new_incompats_id_range = self
+            .incompatibility_store
+            .alloc_iter(incompatibilities.into_iter());
         // Merge the newly created incompatibilities with the older ones.
         for id in IncompDpId::<DP>::range_to_iter(new_incompats_id_range.clone()) {
             self.merge_incompatibility(id);
