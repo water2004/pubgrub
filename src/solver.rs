@@ -430,8 +430,9 @@ where
 /// path.
 ///
 /// [`SolverEvent::Solution`] is emitted once for every returned solution. Intermediate events
-/// between two solution events belong to the continued enumeration path; feasibility probes used
-/// to classify maximality are deliberately not sent to the observer.
+/// between two solution events belong to the continued enumeration path. Maximality probes expose
+/// start/finish boundaries so observers can report dynamically discovered work, while their
+/// internal decisions and derivations remain excluded from the retained solution trace.
 #[cold]
 pub fn resolve_maximal_solutions_with_observer<DP, I, F, O>(
     dependency_provider: &DP,
@@ -456,9 +457,14 @@ where
         .collect();
     let mut solver = SolverState::new(package.clone(), root_version.clone());
     let mut solutions = Vec::new();
+    let mut run = 0;
 
     loop {
-        let solution = match solver.run_until_solution(dependency_provider, observer) {
+        run += 1;
+        observer.on_event(SolverEvent::EnumerationRunStarted { run });
+        let run_result = solver.run_until_solution(dependency_provider, observer);
+        observer.on_event(SolverEvent::EnumerationRunFinished { run });
+        let solution = match run_result {
             Ok(solution) => solution,
             Err(PubGrubError::NoSolution(reason)) if solutions.is_empty() => {
                 return Err(PubGrubError::NoSolution(reason));
@@ -479,6 +485,7 @@ where
             &solution,
             &maximized_packages,
             &strictly_higher,
+            observer,
         )?;
 
         let exclusion = match upgradeable {
@@ -517,17 +524,19 @@ where
     }
 }
 
-fn find_upgradeable_package<DP, F>(
+fn find_upgradeable_package<DP, F, O>(
     dependency_provider: &DP,
     root_package: &DP::P,
     root_version: &DP::V,
     solution: &SelectedDependencies<DP::P, DP::V>,
     maximized_packages: &[DP::P],
     strictly_higher: &F,
+    observer: &mut O,
 ) -> Result<Option<DP::P>, PubGrubError<DP>>
 where
     DP: DependencyProvider,
     F: Fn(&DP::V) -> DP::VS,
+    O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
     for candidate in maximized_packages {
         let Some(current) = solution.get(candidate) else {
@@ -561,7 +570,10 @@ where
             (candidate.clone(), Term::Negative(strictly_higher(current))),
         ]);
 
-        match probe.run_until_solution(dependency_provider, &mut NoopSolverObserver) {
+        observer.on_event(SolverEvent::MaximalityProbeStarted { package: candidate });
+        let result = probe.run_until_solution(dependency_provider, &mut NoopSolverObserver);
+        observer.on_event(SolverEvent::MaximalityProbeFinished { package: candidate });
+        match result {
             Ok(_) => return Ok(Some(candidate.clone())),
             Err(PubGrubError::NoSolution(_)) => {}
             Err(error) => return Err(error),

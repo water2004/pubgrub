@@ -86,6 +86,32 @@ where
         /// Learned incompatibility that caused the backtrack.
         cause: &'a DerivationTree<P, VS, M>,
     },
+    /// A solver continuation used by maximal-solution enumeration is starting.
+    ///
+    /// The number of continuation runs is not known in advance. Observers can
+    /// grow a dynamic work total whenever this event is received.
+    EnumerationRunStarted {
+        /// One-based index of this continuation run.
+        run: usize,
+    },
+    /// A maximal-solution enumeration continuation finished.
+    EnumerationRunFinished {
+        /// One-based index matching [`EnumerationRunStarted`](Self::EnumerationRunStarted).
+        run: usize,
+    },
+    /// A feasibility probe is starting for one projected package.
+    ///
+    /// Probe-internal decisions and derivations are intentionally not exposed:
+    /// they classify maximality and are not part of the retained solution path.
+    MaximalityProbeStarted {
+        /// Projected package being checked for an available strict upgrade.
+        package: &'a P,
+    },
+    /// A projected-package maximality probe finished.
+    MaximalityProbeFinished {
+        /// Projected package checked by the completed probe.
+        package: &'a P,
+    },
     /// The solver found a complete solution.
     Solution,
 }

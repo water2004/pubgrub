@@ -67,12 +67,23 @@ fn disconnected_diagonal_solutions_are_both_locally_maximal() {
 }
 
 #[derive(Default)]
-struct SolutionCounter(usize);
+struct SolutionCounter {
+    solutions: usize,
+    runs_started: usize,
+    runs_finished: usize,
+    probes_started: usize,
+    probes_finished: usize,
+}
 
 impl SolverObserver<&'static str, Ranges<u32>, String> for SolutionCounter {
     fn on_event(&mut self, event: SolverEvent<'_, &'static str, Ranges<u32>, String>) {
-        if matches!(event, SolverEvent::Solution) {
-            self.0 += 1;
+        match event {
+            SolverEvent::Solution => self.solutions += 1,
+            SolverEvent::EnumerationRunStarted { .. } => self.runs_started += 1,
+            SolverEvent::EnumerationRunFinished { .. } => self.runs_finished += 1,
+            SolverEvent::MaximalityProbeStarted { .. } => self.probes_started += 1,
+            SolverEvent::MaximalityProbeFinished { .. } => self.probes_finished += 1,
+            _ => {}
         }
     }
 
@@ -102,7 +113,11 @@ fn observer_reports_only_retained_solutions() {
     .unwrap();
 
     assert_eq!(projected(solutions), BTreeSet::from([(2, 2)]));
-    assert_eq!(observer.0, 1);
+    assert_eq!(observer.solutions, 1);
+    assert!(observer.runs_started > 0);
+    assert_eq!(observer.runs_started, observer.runs_finished);
+    assert!(observer.probes_started > 0);
+    assert_eq!(observer.probes_started, observer.probes_finished);
 }
 
 #[test]
