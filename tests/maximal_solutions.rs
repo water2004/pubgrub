@@ -23,9 +23,14 @@ fn projected(
 
 fn enumerate(provider: &Provider) -> BTreeSet<(u32, u32)> {
     projected(
-        resolve_maximal_solutions(provider, "root", 1u32, ["a", "b"], |version| {
-            Ranges::strictly_higher_than(*version)
-        })
+        resolve_maximal_solutions(
+            provider,
+            "root",
+            1u32,
+            ["a", "b"],
+            |version| Ranges::singleton(*version),
+            |version| Ranges::strictly_higher_than(*version),
+        )
         .unwrap(),
     )
 }
@@ -107,6 +112,7 @@ fn observer_reports_only_retained_solutions() {
         "root",
         1u32,
         ["a", "b"],
+        |version| Ranges::singleton(*version),
         |version| Ranges::strictly_higher_than(*version),
         &mut observer,
     )
@@ -129,11 +135,102 @@ fn packages_outside_the_projection_may_change_during_an_upgrade() {
     provider.add_dependencies("internal-old", 1u32, []);
     provider.add_dependencies("internal-new", 1u32, []);
 
-    let solutions = resolve_maximal_solutions(&provider, "root", 1u32, ["a"], |version| {
-        Ranges::strictly_higher_than(*version)
-    })
+    let solutions = resolve_maximal_solutions(
+        &provider,
+        "root",
+        1u32,
+        ["a"],
+        |version| Ranges::singleton(*version),
+        |version| Ranges::strictly_higher_than(*version),
+    )
     .unwrap();
 
     assert_eq!(solutions.len(), 1);
     assert_eq!(solutions[0].get(&"a"), Some(&2));
+}
+
+#[test]
+fn equivalent_provider_versions_do_not_multiply_projected_solutions() {
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct Realization {
+        version: u32,
+        source: u32,
+    }
+
+    impl std::fmt::Display for Realization {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{} from {}", self.version, self.source)
+        }
+    }
+
+    type RealizationProvider = OfflineDependencyProvider<&'static str, Ranges<Realization>>;
+    let mut provider = RealizationProvider::new();
+    let root = Realization {
+        version: 1,
+        source: 0,
+    };
+    provider.add_dependencies(
+        "root",
+        root.clone(),
+        [("a", Ranges::full()), ("b", Ranges::full())],
+    );
+    for package in ["a", "b"] {
+        for source in 1..=3 {
+            provider.add_dependencies(package, Realization { version: 1, source }, []);
+        }
+    }
+
+    let solutions = resolve_maximal_solutions(
+        &provider,
+        "root",
+        root,
+        ["a", "b"],
+        |selected| {
+            Ranges::between(
+                Realization {
+                    version: selected.version,
+                    source: 0,
+                },
+                Realization {
+                    version: selected.version + 1,
+                    source: 0,
+                },
+            )
+        },
+        |selected| {
+            Ranges::higher_than(Realization {
+                version: selected.version + 1,
+                source: 0,
+            })
+        },
+    )
+    .unwrap();
+
+    assert_eq!(solutions.len(), 1);
+}
+
+#[test]
+fn invalid_strictly_higher_callback_is_rejected_instead_of_repeating() {
+    let mut provider = Provider::new();
+    provider.add_dependencies("root", 1u32, [("a", Ranges::full())]);
+    provider.add_dependencies("a", 1u32, []);
+
+    let error = resolve_maximal_solutions(
+        &provider,
+        "root",
+        1u32,
+        ["a"],
+        |version| Ranges::singleton(*version),
+        |version| Ranges::higher_than(*version),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        pubgrub::PubGrubError::InvalidVersionOrdering {
+            package: "a",
+            version: 1,
+            ..
+        }
+    ));
 }

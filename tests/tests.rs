@@ -225,7 +225,9 @@ fn provider_clauses_participate_in_the_original_derivation() {
     );
 
     let error = resolve(&provider, "root", 1_u32).unwrap_err();
-    let PubGrubError::NoSolution(tree) = error;
+    let PubGrubError::NoSolution(tree) = error else {
+        panic!("expected an unsatisfiable derivation");
+    };
 
     assert!(DefaultStringReporter::report(&tree).contains("a 1 cannot coexist with b 1"));
 }

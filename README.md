@@ -99,11 +99,11 @@ without parsing logs or running a second counterfactual solve. See the runnable
 
 `resolve_maximal_solutions` enumerates every solution in which none of the
 requested packages can be upgraded while every other requested package version
-stays fixed. The requested package list is also the solution projection:
+stays equivalent. The requested package list is also the solution projection:
 solver-internal or otherwise unlisted packages may change and do not create a
 distinct result. This is deliberately different from returning every legal
-version combination: dominated combinations are classified and pruned inside
-the solver.
+provider-version combination: dominated combinations are classified and pruned
+inside the solver.
 
 Use `resolve_maximal_solutions_with_observer` when the application also needs
 the real derivation path for each result. It continues one solver session,
@@ -112,10 +112,17 @@ feasibility probes used for maximality classification out of the observer
 stream. Enumeration clauses have their own `ExcludedSolution` reason, so they
 cannot be mistaken for provider dependency metadata.
 
-The caller supplies the packages to maximize and a function constructing the
-strictly-higher version range. Independent choices can still produce an
-exponential number of maximal solutions; `DependencyProvider::should_cancel`
-is checked throughout enumeration.
+The caller supplies the packages to maximize, a function constructing the
+same-package-version equivalence range, and a function constructing the
+strictly-higher version range. The equivalence range lets applications keep a
+source or artifact identity in the provider version without multiplying
+user-visible solutions. The solver rejects callbacks when the equivalence
+range omits the selected version, overlaps the strictly-higher range, or the
+strictly-higher range contains the selected version; this guarantees that each
+enumeration exclusion removes the solution that produced it.
+
+Independent choices can still make enumeration exponential;
+`DependencyProvider::should_cancel` is checked throughout enumeration.
 
 ## Provider-defined incompatibilities
 

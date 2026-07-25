@@ -11,7 +11,9 @@ All notable changes to this project will be documented in this file.
 - Add `Term::contains` for checking whether a derivation allows a specific version.
 - Add provider-defined incompatibility clauses with typed metadata.
 - Add `resolve_maximal_solutions` and its observer variant for enumerating every solution in
-  which no requested package can be upgraded while all other requested versions stay fixed.
+  which no requested package can be upgraded while all other requested versions stay equivalent.
+- Let maximal-solution callers define package-version equivalence separately from provider-version
+  identity, and reject invalid equivalence/ordering callbacks before they can repeat a solution.
 
 ## 0.4.0 - 2026-04-09
 

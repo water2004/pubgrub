@@ -393,27 +393,37 @@ where
 }
 
 /// Finds every solution in which no maximized package can be upgraded while all other selected
-/// package versions remain fixed.
+/// package versions remain equivalent.
 ///
-/// `strictly_higher` must return the version set strictly greater than its argument. The package
-/// iterator defines both the user-visible solution coordinates and the packages considered for
-/// upgrades. Other coordinates are held fixed while checking an individual upgrade; packages
-/// outside that projection may change and do not make two projected solutions distinct.
+/// `same_version` maps a selected provider version to every provider version representing the same
+/// package version. `strictly_higher` maps it to the set of versions that count as an upgrade. The
+/// package iterator defines both the user-visible solution coordinates and the packages considered
+/// for upgrades. Other projected coordinates remain in their `same_version` sets while checking an
+/// individual upgrade; packages outside that projection may change and do not make two projected
+/// solutions distinct.
+///
+/// For every selected version, `same_version` must contain that version and must be disjoint from
+/// `strictly_higher`; `strictly_higher` must not contain the selected version. The solver validates
+/// these conditions so an invalid ordering cannot make enumeration repeat the same solution
+/// forever. Use [`VersionSet::singleton`] when provider versions have no representation identity
+/// separate from their package version.
 ///
 /// Enumeration may be exponential in the number of independent choices. The dependency
 /// provider's [`should_cancel`](DependencyProvider::should_cancel) hook remains active throughout
 /// both enumeration and maximality checks.
 #[cold]
-pub fn resolve_maximal_solutions<DP, I, F>(
+pub fn resolve_maximal_solutions<DP, I, E, F>(
     dependency_provider: &DP,
     package: DP::P,
     version: impl Into<DP::V>,
     maximized_packages: I,
+    same_version: E,
     strictly_higher: F,
 ) -> Result<MaximalSolutions<DP::P, DP::V>, PubGrubError<DP>>
 where
     DP: DependencyProvider,
     I: IntoIterator<Item = DP::P>,
+    E: Fn(&DP::V) -> DP::VS,
     F: Fn(&DP::V) -> DP::VS,
 {
     resolve_maximal_solutions_with_observer(
@@ -421,6 +431,7 @@ where
         package,
         version,
         maximized_packages,
+        same_version,
         strictly_higher,
         &mut NoopSolverObserver,
     )
@@ -434,17 +445,19 @@ where
 /// start/finish boundaries so observers can report dynamically discovered work, while their
 /// internal decisions and derivations remain excluded from the retained solution trace.
 #[cold]
-pub fn resolve_maximal_solutions_with_observer<DP, I, F, O>(
+pub fn resolve_maximal_solutions_with_observer<DP, I, E, F, O>(
     dependency_provider: &DP,
     package: DP::P,
     version: impl Into<DP::V>,
     maximized_packages: I,
+    same_version: E,
     strictly_higher: F,
     observer: &mut O,
 ) -> Result<MaximalSolutions<DP::P, DP::V>, PubGrubError<DP>>
 where
     DP: DependencyProvider,
     I: IntoIterator<Item = DP::P>,
+    E: Fn(&DP::V) -> DP::VS,
     F: Fn(&DP::V) -> DP::VS,
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
@@ -458,6 +471,10 @@ where
     let mut solver = SolverState::new(package.clone(), root_version.clone());
     let mut solutions = Vec::new();
     let mut run = 0;
+    let version_ordering = VersionOrdering {
+        same_version: &same_version,
+        strictly_higher: &strictly_higher,
+    };
 
     loop {
         run += 1;
@@ -472,19 +489,19 @@ where
             Err(PubGrubError::NoSolution(_)) => return Ok(solutions),
             Err(error) => return Err(error),
         };
-
         if maximized_packages.is_empty() {
             observer.on_event(SolverEvent::Solution);
             return Ok(vec![solution]);
         }
 
+        validate_version_ordering(&solution, &maximized_packages, &version_ordering)?;
         let upgradeable = find_upgradeable_package(
             dependency_provider,
             &package,
             &root_version,
             &solution,
             &maximized_packages,
-            &strictly_higher,
+            &version_ordering,
             observer,
         )?;
 
@@ -494,9 +511,9 @@ where
                 .filter(|(selected, _)| maximized_packages.contains(selected))
                 .map(|(selected, version)| {
                     let versions = if selected == &upgradeable {
-                        strictly_higher(version).complement()
+                        (version_ordering.strictly_higher)(version).complement()
                     } else {
-                        DP::VS::singleton(version.clone())
+                        (version_ordering.same_version)(version)
                     };
                     (selected.clone(), Term::Positive(versions))
                 })
@@ -509,7 +526,7 @@ where
                     .map(|(selected, version)| {
                         (
                             selected.clone(),
-                            Term::Positive(DP::VS::singleton(version.clone())),
+                            Term::Positive((version_ordering.same_version)(version)),
                         )
                     })
                     .collect();
@@ -524,17 +541,59 @@ where
     }
 }
 
-fn find_upgradeable_package<DP, F, O>(
+struct VersionOrdering<'a, E, F> {
+    same_version: &'a E,
+    strictly_higher: &'a F,
+}
+
+fn validate_version_ordering<DP, E, F>(
+    solution: &SelectedDependencies<DP::P, DP::V>,
+    maximized_packages: &[DP::P],
+    ordering: &VersionOrdering<'_, E, F>,
+) -> Result<(), PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    E: Fn(&DP::V) -> DP::VS,
+    F: Fn(&DP::V) -> DP::VS,
+{
+    for (package, version) in solution
+        .iter()
+        .filter(|(package, _)| maximized_packages.contains(package))
+    {
+        let equivalent = (ordering.same_version)(version);
+        let higher = (ordering.strictly_higher)(version);
+        let reason = if !equivalent.contains(version) {
+            Some("same_version must contain the selected version")
+        } else if higher.contains(version) {
+            Some("strictly_higher must not contain the selected version")
+        } else if !equivalent.is_disjoint(&higher) {
+            Some("same_version and strictly_higher must be disjoint")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(PubGrubError::InvalidVersionOrdering {
+                package: package.clone(),
+                version: version.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn find_upgradeable_package<DP, E, F, O>(
     dependency_provider: &DP,
     root_package: &DP::P,
     root_version: &DP::V,
     solution: &SelectedDependencies<DP::P, DP::V>,
     maximized_packages: &[DP::P],
-    strictly_higher: &F,
+    ordering: &VersionOrdering<'_, E, F>,
     observer: &mut O,
 ) -> Result<Option<DP::P>, PubGrubError<DP>>
 where
     DP: DependencyProvider,
+    E: Fn(&DP::V) -> DP::VS,
     F: Fn(&DP::V) -> DP::VS,
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
@@ -561,13 +620,16 @@ where
                 root_term(),
                 (
                     selected.clone(),
-                    Term::Negative(DP::VS::singleton(version.clone())),
+                    Term::Negative((ordering.same_version)(version)),
                 ),
             ]);
         }
         probe.add_solution_exclusion([
             root_term(),
-            (candidate.clone(), Term::Negative(strictly_higher(current))),
+            (
+                candidate.clone(),
+                Term::Negative((ordering.strictly_higher)(current)),
+            ),
         ]);
 
         observer.on_event(SolverEvent::MaximalityProbeStarted { package: candidate });

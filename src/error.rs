@@ -46,6 +46,18 @@ pub enum PubGrubError<DP: DependencyProvider> {
     /// returned an error in the method [`should_cancel`](DependencyProvider::should_cancel).
     #[error("The solver was cancelled")]
     ErrorInShouldCancel(#[source] DP::Err),
+
+    /// The version equivalence or ordering callbacks supplied for maximal-solution enumeration
+    /// violated their contract.
+    #[error("Invalid maximal-solution ordering for {package} {version}: {reason}")]
+    InvalidVersionOrdering {
+        /// Package whose selected version exposed the invalid ordering.
+        package: DP::P,
+        /// Selected version passed to the ordering callbacks.
+        version: DP::V,
+        /// Contract violation detected by the solver.
+        reason: &'static str,
+    },
 }
 
 impl<DP: DependencyProvider> From<NoSolutionError<DP>> for PubGrubError<DP> {
@@ -79,6 +91,16 @@ where
             Self::ErrorInShouldCancel(arg0) => {
                 f.debug_tuple("ErrorInShouldCancel").field(arg0).finish()
             }
+            Self::InvalidVersionOrdering {
+                package,
+                version,
+                reason,
+            } => f
+                .debug_struct("InvalidVersionOrdering")
+                .field("package", package)
+                .field("version", version)
+                .field("reason", reason)
+                .finish(),
         }
     }
 }
