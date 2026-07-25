@@ -224,7 +224,7 @@ mod version;
 mod version_set;
 
 pub use error::{NoSolutionError, PubGrubError};
-pub use observer::{SolverEvent, SolverObserver};
+pub use observer::{MaximalityProbeResult, SolverEvent, SolverObserver};
 pub use package::Package;
 pub use provider::OfflineDependencyProvider;
 pub use report::{

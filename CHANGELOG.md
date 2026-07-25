@@ -10,10 +10,12 @@ All notable changes to this project will be documented in this file.
   decisions, derivations, conflicts, and backtracks of a successful or failed solver run.
 - Add `Term::contains` for checking whether a derivation allows a specific version.
 - Add provider-defined incompatibility clauses with typed metadata.
-- Add `resolve_maximal_solutions` and its observer variant for enumerating every solution in
-  which no requested package can be upgraded while all other requested versions stay equivalent.
+- Add `resolve_maximal_solutions` and its observer variant for enumerating the complete Pareto
+  front of requested package versions.
 - Let maximal-solution callers define package-version equivalence separately from provider-version
   identity, and reject invalid equivalence/ordering callbacks before they can repeat a solution.
+- Exclude the complete region dominated by each retained Pareto point, and expose transactional
+  probe outcomes so observers retain the actual successful improvement path.
 
 ## 0.4.0 - 2026-04-09
 

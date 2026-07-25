@@ -60,7 +60,7 @@ fn upgrade_tradeoff_returns_both_maximal_solutions() {
 }
 
 #[test]
-fn disconnected_diagonal_solutions_are_both_locally_maximal() {
+fn a_coordinated_upgrade_dominates_the_lower_diagonal_solution() {
     let mut provider = Provider::new();
     provider.add_dependencies("root", 1u32, [("a", Ranges::full()), ("b", Ranges::full())]);
     provider.add_dependencies("a", 1u32, [("b", Ranges::singleton(1u32))]);
@@ -68,7 +68,7 @@ fn disconnected_diagonal_solutions_are_both_locally_maximal() {
     provider.add_dependencies("b", 1u32, []);
     provider.add_dependencies("b", 2u32, []);
 
-    assert_eq!(enumerate(&provider), BTreeSet::from([(1, 1), (2, 2)]));
+    assert_eq!(enumerate(&provider), BTreeSet::from([(2, 2)]));
 }
 
 #[derive(Default)]
@@ -120,7 +120,7 @@ fn observer_reports_only_retained_solutions() {
 
     assert_eq!(projected(solutions), BTreeSet::from([(2, 2)]));
     assert_eq!(observer.solutions, 1);
-    assert!(observer.runs_started > 0);
+    assert_eq!(observer.runs_started, 2);
     assert_eq!(observer.runs_started, observer.runs_finished);
     assert!(observer.probes_started > 0);
     assert_eq!(observer.probes_started, observer.probes_finished);
@@ -233,4 +233,52 @@ fn invalid_strictly_higher_callback_is_rejected_instead_of_repeating() {
             ..
         }
     ));
+}
+
+#[test]
+fn pareto_enumeration_matches_every_three_by_three_feasibility_relation() {
+    let all_points: Vec<_> = (1u32..=3)
+        .flat_map(|a| (1u32..=3).map(move |b| (a, b)))
+        .collect();
+
+    for feasible_bits in 1u16..(1 << all_points.len()) {
+        let feasible: BTreeSet<_> = all_points
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| feasible_bits & (1 << index) != 0)
+            .map(|(_, point)| *point)
+            .collect();
+        let expected: BTreeSet<_> = feasible
+            .iter()
+            .copied()
+            .filter(|point| {
+                !feasible.iter().any(|other| {
+                    other.0 >= point.0
+                        && other.1 >= point.1
+                        && (other.0 > point.0 || other.1 > point.1)
+                })
+            })
+            .collect();
+
+        let mut provider = Provider::new();
+        provider.add_dependencies("root", 1u32, [("a", Ranges::full()), ("b", Ranges::full())]);
+        for a in 1u32..=3 {
+            let allowed_b = feasible
+                .iter()
+                .filter(|point| point.0 == a)
+                .fold(Ranges::empty(), |versions, point| {
+                    versions.union(&Ranges::singleton(point.1))
+                });
+            provider.add_dependencies("a", a, [("b", allowed_b)]);
+        }
+        for b in 1u32..=3 {
+            provider.add_dependencies("b", b, []);
+        }
+
+        assert_eq!(
+            enumerate(&provider),
+            expected,
+            "wrong Pareto front for feasible relation {feasible:?}"
+        );
+    }
 }

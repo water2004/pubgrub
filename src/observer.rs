@@ -17,6 +17,18 @@ use std::fmt::{Debug, Display};
 
 use crate::{DerivationTree, Package, Term, VersionSet};
 
+/// Outcome of a projected-package feasibility probe used to grow a Pareto solution.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum MaximalityProbeResult {
+    /// The probe found a solution that strictly improves the selected package without lowering
+    /// any other selected projected package.
+    Improved,
+    /// No such dominating solution exists for the selected package.
+    NoImprovement,
+    /// The probe stopped because the dependency provider returned an error.
+    Error,
+}
+
 /// A structured event emitted while resolving dependencies.
 ///
 /// Events describe the path taken by a specific solver run. They are not a proof that an
@@ -101,16 +113,19 @@ where
     },
     /// A feasibility probe is starting for one projected package.
     ///
-    /// Probe-internal decisions and derivations are intentionally not exposed:
-    /// they classify maximality and are not part of the retained solution path.
+    /// Probe-internal events follow this boundary. Observers that retain path state should
+    /// checkpoint it here, then either commit or roll it back according to the matching
+    /// [`MaximalityProbeFinished`](Self::MaximalityProbeFinished) result.
     MaximalityProbeStarted {
-        /// Projected package being checked for an available strict upgrade.
+        /// Projected package being checked for a dominating strict upgrade.
         package: &'a P,
     },
     /// A projected-package maximality probe finished.
     MaximalityProbeFinished {
         /// Projected package checked by the completed probe.
         package: &'a P,
+        /// Whether the probe found a dominating solution.
+        result: MaximalityProbeResult,
     },
     /// The solver found a complete solution.
     Solution,

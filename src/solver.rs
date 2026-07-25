@@ -52,8 +52,13 @@ impl PackageResolutionStatistics {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedDependencies<P: Package, V>(Map<P, V>);
 
-/// All locally maximal solutions returned by [`resolve_maximal_solutions`].
+/// All Pareto-maximal solutions returned by [`resolve_maximal_solutions`].
 pub type MaximalSolutions<P, V> = Vec<SelectedDependencies<P, V>>;
+
+type DominatingSolutionResult<DP> = Result<
+    Option<SelectedDependencies<<DP as DependencyProvider>::P, <DP as DependencyProvider>::V>>,
+    PubGrubError<DP>,
+>;
 
 impl<P: Package, V> SelectedDependencies<P, V> {
     /// Iterate over the resolved dependencies and their versions.
@@ -392,15 +397,14 @@ where
     Ok(solution)
 }
 
-/// Finds every solution in which no maximized package can be upgraded while all other selected
-/// package versions remain equivalent.
+/// Finds the complete Pareto front of the selected package versions.
 ///
 /// `same_version` maps a selected provider version to every provider version representing the same
 /// package version. `strictly_higher` maps it to the set of versions that count as an upgrade. The
 /// package iterator defines both the user-visible solution coordinates and the packages considered
-/// for upgrades. Other projected coordinates remain in their `same_version` sets while checking an
-/// individual upgrade; packages outside that projection may change and do not make two projected
-/// solutions distinct.
+/// for upgrades. A solution is retained exactly when there is no other feasible solution in which
+/// every selected projected package is equivalent or higher and at least one is strictly higher.
+/// Packages outside that projection may change and do not make two projected solutions distinct.
 ///
 /// For every selected version, `same_version` must contain that version and must be disjoint from
 /// `strictly_higher`; `strictly_higher` must not contain the selected version. The solver validates
@@ -408,9 +412,11 @@ where
 /// forever. Use [`VersionSet::singleton`] when provider versions have no representation identity
 /// separate from their package version.
 ///
-/// Enumeration may be exponential in the number of independent choices. The dependency
-/// provider's [`should_cancel`](DependencyProvider::should_cancel) hook remains active throughout
-/// both enumeration and maximality checks.
+/// Each retained point excludes the complete region it dominates, rather than only its exact
+/// projection. Enumeration is therefore driven by the size and shape of the Pareto and co-Pareto
+/// fronts instead of visiting the Cartesian product of independent dominated choices. The
+/// dependency provider's [`should_cancel`](DependencyProvider::should_cancel) hook remains active
+/// throughout both enumeration and maximality checks.
 #[cold]
 pub fn resolve_maximal_solutions<DP, I, E, F>(
     dependency_provider: &DP,
@@ -437,13 +443,12 @@ where
     )
 }
 
-/// Finds every single-package-maximal solution and reports each retained solution's actual solver
-/// path.
+/// Finds the complete Pareto front and reports each retained solution's actual solver path.
 ///
 /// [`SolverEvent::Solution`] is emitted once for every returned solution. Intermediate events
-/// between two solution events belong to the continued enumeration path. Maximality probes expose
-/// start/finish boundaries so observers can report dynamically discovered work, while their
-/// internal decisions and derivations remain excluded from the retained solution trace.
+/// between two solution events belong to the continued enumeration path. A successful maximality
+/// probe becomes the path of the improved candidate; a failed probe does not. Probe boundaries and
+/// outcomes let stateful observers commit or roll back the enclosed events accordingly.
 #[cold]
 pub fn resolve_maximal_solutions_with_observer<DP, I, E, F, O>(
     dependency_provider: &DP,
@@ -481,7 +486,7 @@ where
         observer.on_event(SolverEvent::EnumerationRunStarted { run });
         let run_result = solver.run_until_solution(dependency_provider, observer);
         observer.on_event(SolverEvent::EnumerationRunFinished { run });
-        let solution = match run_result {
+        let mut solution = match run_result {
             Ok(solution) => solution,
             Err(PubGrubError::NoSolution(reason)) if solutions.is_empty() => {
                 return Err(PubGrubError::NoSolution(reason));
@@ -494,46 +499,35 @@ where
             return Ok(vec![solution]);
         }
 
-        validate_version_ordering(&solution, &maximized_packages, &version_ordering)?;
-        let upgradeable = find_upgradeable_package(
-            dependency_provider,
-            &package,
-            &root_version,
-            &solution,
-            &maximized_packages,
-            &version_ordering,
-            observer,
-        )?;
+        loop {
+            validate_version_ordering(&solution, &maximized_packages, &version_ordering)?;
+            let Some(dominating) = find_dominating_solution(
+                dependency_provider,
+                &package,
+                &root_version,
+                &solution,
+                &maximized_packages,
+                &version_ordering,
+                observer,
+            )?
+            else {
+                break;
+            };
+            solution = dominating;
+        }
 
-        let exclusion = match upgradeable {
-            Some(upgradeable) => solution
-                .iter()
-                .filter(|(selected, _)| maximized_packages.contains(selected))
-                .map(|(selected, version)| {
-                    let versions = if selected == &upgradeable {
-                        (version_ordering.strictly_higher)(version).complement()
-                    } else {
-                        (version_ordering.same_version)(version)
-                    };
-                    (selected.clone(), Term::Positive(versions))
-                })
-                .collect::<Vec<_>>(),
-            None => {
-                observer.on_event(SolverEvent::Solution);
-                let exclusion = solution
-                    .iter()
-                    .filter(|(selected, _)| maximized_packages.contains(selected))
-                    .map(|(selected, version)| {
-                        (
-                            selected.clone(),
-                            Term::Positive((version_ordering.same_version)(version)),
-                        )
-                    })
-                    .collect();
-                solutions.push(solution);
-                exclusion
-            }
-        };
+        observer.on_event(SolverEvent::Solution);
+        let exclusion = solution
+            .iter()
+            .filter(|(selected, _)| maximized_packages.contains(selected))
+            .map(|(selected, version)| {
+                (
+                    selected.clone(),
+                    Term::Negative((version_ordering.strictly_higher)(version)),
+                )
+            })
+            .collect::<Vec<_>>();
+        solutions.push(solution);
 
         if !solver.add_solution_exclusion(exclusion) {
             return Ok(solutions);
@@ -582,7 +576,7 @@ where
     Ok(())
 }
 
-fn find_upgradeable_package<DP, E, F, O>(
+fn find_dominating_solution<DP, E, F, O>(
     dependency_provider: &DP,
     root_package: &DP::P,
     root_version: &DP::V,
@@ -590,7 +584,7 @@ fn find_upgradeable_package<DP, E, F, O>(
     maximized_packages: &[DP::P],
     ordering: &VersionOrdering<'_, E, F>,
     observer: &mut O,
-) -> Result<Option<DP::P>, PubGrubError<DP>>
+) -> DominatingSolutionResult<DP>
 where
     DP: DependencyProvider,
     E: Fn(&DP::V) -> DP::VS,
@@ -598,9 +592,9 @@ where
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
     for candidate in maximized_packages {
-        let Some(current) = solution.get(candidate) else {
+        if solution.get(candidate).is_none() {
             continue;
-        };
+        }
         let mut probe = SolverState::new(root_package.clone(), root_version.clone());
         let root_term = || {
             (
@@ -610,33 +604,33 @@ where
         };
 
         for (selected, version) in solution.iter() {
-            if selected == root_package
-                || selected == candidate
-                || !maximized_packages.contains(selected)
-            {
+            if selected == root_package || !maximized_packages.contains(selected) {
                 continue;
             }
+            let required = if selected == candidate {
+                (ordering.strictly_higher)(version)
+            } else {
+                (ordering.same_version)(version).union(&(ordering.strictly_higher)(version))
+            };
             probe.add_solution_exclusion([
                 root_term(),
-                (
-                    selected.clone(),
-                    Term::Negative((ordering.same_version)(version)),
-                ),
+                (selected.clone(), Term::Negative(required)),
             ]);
         }
-        probe.add_solution_exclusion([
-            root_term(),
-            (
-                candidate.clone(),
-                Term::Negative((ordering.strictly_higher)(current)),
-            ),
-        ]);
 
         observer.on_event(SolverEvent::MaximalityProbeStarted { package: candidate });
-        let result = probe.run_until_solution(dependency_provider, &mut NoopSolverObserver);
-        observer.on_event(SolverEvent::MaximalityProbeFinished { package: candidate });
+        let result = probe.run_until_solution(dependency_provider, observer);
+        let probe_result = match &result {
+            Ok(_) => crate::MaximalityProbeResult::Improved,
+            Err(PubGrubError::NoSolution(_)) => crate::MaximalityProbeResult::NoImprovement,
+            Err(_) => crate::MaximalityProbeResult::Error,
+        };
+        observer.on_event(SolverEvent::MaximalityProbeFinished {
+            package: candidate,
+            result: probe_result,
+        });
         match result {
-            Ok(_) => return Ok(Some(candidate.clone())),
+            Ok(solution) => return Ok(Some(solution)),
             Err(PubGrubError::NoSolution(_)) => {}
             Err(error) => return Err(error),
         }

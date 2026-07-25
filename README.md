@@ -95,22 +95,27 @@ be cloned and rendered with application-specific package names and messages,
 without parsing logs or running a second counterfactual solve. See the runnable
 [`explain_version`](./examples/explain_version.rs) example.
 
-## Enumerating locally maximal solutions
+## Enumerating Pareto-maximal solutions
 
-`resolve_maximal_solutions` enumerates every solution in which none of the
-requested packages can be upgraded while every other requested package version
-stays equivalent. The requested package list is also the solution projection:
+`resolve_maximal_solutions` enumerates the complete Pareto front of the
+requested packages: there is no other feasible solution in which every selected
+requested package stays equivalent or moves higher and at least one moves
+strictly higher. The requested package list is also the solution projection;
 solver-internal or otherwise unlisted packages may change and do not create a
-distinct result. This is deliberately different from returning every legal
-provider-version combination: dominated combinations are classified and pruned
-inside the solver.
+distinct result.
+
+The enumerator grows each candidate along non-decreasing projected coordinates
+until it reaches a Pareto point. It then excludes the whole region dominated by
+that point. Independent lower versions therefore do not create a Cartesian
+product of locally maximality checks.
 
 Use `resolve_maximal_solutions_with_observer` when the application also needs
-the real derivation path for each result. It continues one solver session,
-emits `SolverEvent::Solution` once per retained solution, and keeps the
-feasibility probes used for maximality classification out of the observer
-stream. Enumeration clauses have their own `ExcludedSolution` reason, so they
-cannot be mistaken for provider dependency metadata.
+the real derivation path for each result. It continues one enumeration session
+and emits `SolverEvent::Solution` once per retained point. Feasibility probes
+have typed start/finish boundaries and outcomes. A successful probe becomes the
+new retained path; a failed probe can be rolled back by a stateful observer.
+Enumeration clauses have their own `ExcludedSolution` reason, so they cannot
+be mistaken for provider dependency metadata.
 
 The caller supplies the packages to maximize, a function constructing the
 same-package-version equivalence range, and a function constructing the
@@ -121,7 +126,7 @@ range omits the selected version, overlaps the strictly-higher range, or the
 strictly-higher range contains the selected version; this guarantees that each
 enumeration exclusion removes the solution that produced it.
 
-Independent choices can still make enumeration exponential;
+The Pareto or co-Pareto front can still be large;
 `DependencyProvider::should_cancel` is checked throughout enumeration.
 
 ## Provider-defined incompatibilities
