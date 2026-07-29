@@ -835,7 +835,7 @@ where
             root_version,
             &[(preference.package.clone(), preference.preferred.clone())],
         );
-        observer.on_event(SolverEvent::MaximalityProbeStarted {
+        observer.on_event(SolverEvent::PreferenceProbeStarted {
             package: &preference.package,
         });
         let result = probe.run_until_solution(dependency_provider, &mut NoopSolverObserver);
@@ -844,7 +844,7 @@ where
             Err(PubGrubError::NoSolution(_)) => crate::MaximalityProbeResult::NoImprovement,
             Err(_) => crate::MaximalityProbeResult::Error,
         };
-        observer.on_event(SolverEvent::MaximalityProbeFinished {
+        observer.on_event(SolverEvent::PreferenceProbeFinished {
             package: &preference.package,
             result: probe_result,
         });

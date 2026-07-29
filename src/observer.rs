@@ -127,6 +127,18 @@ where
         /// Whether the probe found a dominating solution.
         result: MaximalityProbeResult,
     },
+    /// A feasibility probe is starting for one soft baseline preference.
+    PreferenceProbeStarted {
+        /// Package whose current state is being tested for preservation.
+        package: &'a P,
+    },
+    /// A baseline-preference feasibility probe finished.
+    PreferenceProbeFinished {
+        /// Package checked by the completed preservation probe.
+        package: &'a P,
+        /// Whether the probe found a solution preserving a strict superset of preferences.
+        result: MaximalityProbeResult,
+    },
     /// The solver found a complete solution.
     Solution,
 }
