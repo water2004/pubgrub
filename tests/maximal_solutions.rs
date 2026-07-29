@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 
 use pubgrub::{
-    OfflineDependencyProvider, Ranges, SolverEvent, SolverObserver, VersionOrdering,
-    resolve_maximal_solutions, resolve_maximal_solutions_with_observer,
+    OfflineDependencyProvider, PackagePreference, Ranges, SolverEvent, SolverObserver,
+    VersionOrdering, resolve_maximal_solutions, resolve_maximal_solutions_with_observer,
+    resolve_minimal_change_solutions,
 };
 
 type Provider = OfflineDependencyProvider<&'static str, Ranges<u32>>;
@@ -36,6 +37,140 @@ fn enumerate(provider: &Provider) -> BTreeSet<(u32, u32)> {
         )
         .unwrap(),
     )
+}
+
+type NumericOrdering =
+    VersionOrdering<fn(&u32) -> Ranges<u32>, fn(&u32) -> Ranges<u32>, fn(&u32) -> Ranges<u32>>;
+
+fn same_numeric_version(version: &u32) -> Ranges<u32> {
+    Ranges::singleton(*version)
+}
+
+fn higher_numeric_versions(version: &u32) -> Ranges<u32> {
+    Ranges::strictly_higher_than(*version)
+}
+
+fn ordering() -> NumericOrdering {
+    VersionOrdering::new(
+        same_numeric_version,
+        same_numeric_version,
+        higher_numeric_versions,
+    )
+}
+
+#[test]
+fn minimal_change_preserves_an_installed_version_instead_of_upgrading_it() {
+    let mut provider = Provider::new();
+    provider.add_dependencies("root", 1u32, [("a", Ranges::full())]);
+    provider.add_dependencies("a", 1u32, []);
+    provider.add_dependencies("a", 2u32, []);
+
+    let solutions = resolve_minimal_change_solutions(
+        &provider,
+        "root",
+        1u32,
+        [PackagePreference::selected("a", Ranges::singleton(1u32))],
+        ["a"],
+        ordering(),
+    )
+    .unwrap();
+
+    assert_eq!(solutions.len(), 1);
+    assert_eq!(solutions[0].get(&"a"), Some(&1));
+}
+
+#[test]
+fn incomparable_minimal_change_sets_are_all_returned() {
+    let mut provider = Provider::new();
+    provider.add_dependencies("root", 1u32, [("choice", Ranges::full())]);
+    provider.add_dependencies(
+        "choice",
+        1u32,
+        [
+            ("a", Ranges::singleton(1u32)),
+            ("b", Ranges::singleton(2u32)),
+        ],
+    );
+    provider.add_dependencies(
+        "choice",
+        2u32,
+        [
+            ("a", Ranges::singleton(2u32)),
+            ("b", Ranges::singleton(1u32)),
+        ],
+    );
+    provider.add_dependencies(
+        "choice",
+        3u32,
+        [
+            ("a", Ranges::singleton(2u32)),
+            ("b", Ranges::singleton(2u32)),
+        ],
+    );
+    for package in ["a", "b"] {
+        provider.add_dependencies(package, 1u32, []);
+        provider.add_dependencies(package, 2u32, []);
+    }
+
+    let solutions = resolve_minimal_change_solutions(
+        &provider,
+        "root",
+        1u32,
+        [
+            PackagePreference::selected("a", Ranges::singleton(1u32)),
+            PackagePreference::selected("b", Ranges::singleton(1u32)),
+        ],
+        ["a", "b"],
+        ordering(),
+    )
+    .unwrap();
+
+    assert_eq!(projected(solutions), BTreeSet::from([(1, 2), (2, 1)]));
+}
+
+#[test]
+fn absence_preference_avoids_an_unnecessary_new_package() {
+    let mut provider = Provider::new();
+    provider.add_dependencies("root", 1u32, [("choice", Ranges::full())]);
+    provider.add_dependencies("choice", 1u32, []);
+    provider.add_dependencies("choice", 2u32, [("addon", Ranges::singleton(1u32))]);
+    provider.add_dependencies("addon", 1u32, []);
+
+    let solutions = resolve_minimal_change_solutions(
+        &provider,
+        "root",
+        1u32,
+        [PackagePreference::absent("addon")],
+        ["choice", "addon"],
+        ordering(),
+    )
+    .unwrap();
+
+    assert_eq!(solutions.len(), 1);
+    assert_eq!(solutions[0].get(&"choice"), Some(&1));
+    assert_eq!(solutions[0].get(&"addon"), None);
+}
+
+#[test]
+fn versions_are_maximized_only_after_the_change_set_is_fixed() {
+    let mut provider = Provider::new();
+    provider.add_dependencies("root", 1u32, [("a", Ranges::strictly_higher_than(1u32))]);
+    for version in 1u32..=3 {
+        provider.add_dependencies("a", version, []);
+    }
+
+    let solutions = resolve_minimal_change_solutions(
+        &provider,
+        "root",
+        1u32,
+        [PackagePreference::selected("a", Ranges::singleton(1u32))],
+        ["a"],
+        ordering(),
+    )
+    .unwrap();
+
+    assert_eq!(solutions.len(), 1);
+    assert_eq!(solutions[0].get(&"a"), Some(&3));
 }
 
 #[test]

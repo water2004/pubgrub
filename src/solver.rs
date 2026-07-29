@@ -62,6 +62,35 @@ pub struct VersionOrdering<E, R, F> {
     strictly_higher: F,
 }
 
+/// A soft package-state condition used by minimal-change solution enumeration.
+///
+/// A solution which satisfies a strict superset of these conditions changes a strict subset of
+/// the caller's baseline state. Preferences are optimized by set inclusion, not by assigning
+/// arbitrary numeric weights to packages.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PackagePreference<P: Package, VS: VersionSet> {
+    package: P,
+    preferred: Term<VS>,
+}
+
+impl<P: Package, VS: VersionSet> PackagePreference<P, VS> {
+    /// Prefer selecting this package inside the supplied version set.
+    pub fn selected(package: P, versions: VS) -> Self {
+        Self {
+            package,
+            preferred: Term::Positive(versions),
+        }
+    }
+
+    /// Prefer leaving this package absent from the solution.
+    pub fn absent(package: P) -> Self {
+        Self {
+            package,
+            preferred: Term::Negative(VS::full()),
+        }
+    }
+}
+
 impl<E, R, F> VersionOrdering<E, R, F> {
     /// Construct identity, equal-precedence, and strictly-higher version-set mappings.
     pub fn new(same_version: E, same_precedence: R, strictly_higher: F) -> Self {
@@ -489,14 +518,198 @@ where
         .filter(|candidate| candidate != &package)
         .filter(|candidate| seen.insert(candidate.clone()))
         .collect();
-    let mut solver = SolverState::new(package.clone(), root_version.clone());
-    let mut solutions = Vec::new();
-    let mut run = 0;
     let version_ordering = BorrowedVersionOrdering {
         same_version: &version_ordering.same_version,
         same_precedence: &version_ordering.same_precedence,
         strictly_higher: &version_ordering.strictly_higher,
     };
+
+    enumerate_maximal_solutions_with_constraints(
+        dependency_provider,
+        &package,
+        &root_version,
+        &maximized_packages,
+        &version_ordering,
+        &[],
+        observer,
+    )
+}
+
+/// Finds every standard Pareto-minimal change set and, within each equal change set, retains the
+/// Pareto-maximal projected versions.
+///
+/// Each [`PackagePreference`] describes one fact from the caller's baseline state. A solution is
+/// discarded when another feasible solution satisfies a strict superset of its preferences. This
+/// is the set-inclusion definition of minimal change: no package preference can be restored without
+/// losing another one that the solution already preserves. Incomparable minimal change sets are all
+/// returned.
+///
+/// Version maximization is secondary and is performed only among solutions with exactly the same
+/// satisfied preference set. It therefore cannot upgrade an otherwise preservable package merely
+/// to obtain a newer solution. The same identity, precedence, and strict-upgrade callbacks used by
+/// [`resolve_maximal_solutions`] define this secondary Pareto front.
+#[cold]
+pub fn resolve_minimal_change_solutions<DP, PI, MI, E, R, F>(
+    dependency_provider: &DP,
+    package: DP::P,
+    version: impl Into<DP::V>,
+    preferences: PI,
+    maximized_packages: MI,
+    version_ordering: VersionOrdering<E, R, F>,
+) -> Result<MaximalSolutions<DP::P, DP::V>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    PI: IntoIterator<Item = PackagePreference<DP::P, DP::VS>>,
+    MI: IntoIterator<Item = DP::P>,
+    E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
+    F: Fn(&DP::V) -> DP::VS,
+{
+    resolve_minimal_change_solutions_with_observer(
+        dependency_provider,
+        package,
+        version,
+        preferences,
+        maximized_packages,
+        version_ordering,
+        &mut NoopSolverObserver,
+    )
+}
+
+/// Minimal-change solution enumeration with observer events for every returned solver path.
+///
+/// Preference-front feasibility work emits enumeration and maximality-probe boundaries, while the
+/// decision and derivation events retained by the observer come from the secondary version solve
+/// which produced each returned solution. This keeps path diagnostics aligned with actual output.
+#[cold]
+pub fn resolve_minimal_change_solutions_with_observer<DP, PI, MI, E, R, F, O>(
+    dependency_provider: &DP,
+    package: DP::P,
+    version: impl Into<DP::V>,
+    preferences: PI,
+    maximized_packages: MI,
+    version_ordering: VersionOrdering<E, R, F>,
+    observer: &mut O,
+) -> Result<MaximalSolutions<DP::P, DP::V>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    PI: IntoIterator<Item = PackagePreference<DP::P, DP::VS>>,
+    MI: IntoIterator<Item = DP::P>,
+    E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
+    F: Fn(&DP::V) -> DP::VS,
+    O: SolverObserver<DP::P, DP::VS, DP::M>,
+{
+    let root_version = version.into();
+    let preferences = preferences
+        .into_iter()
+        .filter(|preference| preference.package != package)
+        .filter(|preference| {
+            preference.preferred != Term::any() && preference.preferred != Term::empty()
+        })
+        .collect::<Vec<_>>();
+    let mut seen = PackageSet::default();
+    let maximized_packages = maximized_packages
+        .into_iter()
+        .filter(|candidate| candidate != &package)
+        .filter(|candidate| seen.insert(candidate.clone()))
+        .collect::<Vec<_>>();
+    let version_ordering = BorrowedVersionOrdering {
+        same_version: &version_ordering.same_version,
+        same_precedence: &version_ordering.same_precedence,
+        strictly_higher: &version_ordering.strictly_higher,
+    };
+    let mut preference_solver = SolverState::new(package.clone(), root_version.clone());
+    let mut solutions = Vec::new();
+    let mut run = 0;
+
+    loop {
+        run += 1;
+        observer.on_event(SolverEvent::EnumerationRunStarted { run });
+        let result =
+            preference_solver.run_until_solution(dependency_provider, &mut NoopSolverObserver);
+        observer.on_event(SolverEvent::EnumerationRunFinished { run });
+        let mut solution = match result {
+            Ok(solution) => solution,
+            Err(PubGrubError::NoSolution(reason)) if solutions.is_empty() => {
+                return Err(PubGrubError::NoSolution(reason));
+            }
+            Err(PubGrubError::NoSolution(_)) => return Ok(solutions),
+            Err(error) => return Err(error),
+        };
+
+        loop {
+            let Some(improved) = find_preference_dominating_solution(
+                dependency_provider,
+                &package,
+                &root_version,
+                &solution,
+                &preferences,
+                observer,
+            )?
+            else {
+                break;
+            };
+            solution = improved;
+        }
+
+        let satisfaction = preference_satisfaction::<DP>(&solution, &preferences);
+        let fixed_preferences = preferences
+            .iter()
+            .zip(&satisfaction)
+            .map(|(preference, satisfied)| {
+                (
+                    preference.package.clone(),
+                    if *satisfied {
+                        preference.preferred.clone()
+                    } else {
+                        preference.preferred.negate()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        solutions.extend(enumerate_maximal_solutions_with_constraints(
+            dependency_provider,
+            &package,
+            &root_version,
+            &maximized_packages,
+            &version_ordering,
+            &fixed_preferences,
+            observer,
+        )?);
+
+        let dominated_preference_region = preferences
+            .iter()
+            .zip(&satisfaction)
+            .filter(|(_, satisfied)| !**satisfied)
+            .map(|(preference, _)| (preference.package.clone(), preference.preferred.negate()))
+            .collect::<Vec<_>>();
+        if !preference_solver.add_solution_exclusion(dominated_preference_region) {
+            return Ok(solutions);
+        }
+    }
+}
+
+fn enumerate_maximal_solutions_with_constraints<DP, E, R, F, O>(
+    dependency_provider: &DP,
+    root_package: &DP::P,
+    root_version: &DP::V,
+    maximized_packages: &[DP::P],
+    version_ordering: &BorrowedVersionOrdering<'_, E, R, F>,
+    required_terms: &[(DP::P, Term<DP::VS>)],
+    observer: &mut O,
+) -> Result<MaximalSolutions<DP::P, DP::V>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
+    F: Fn(&DP::V) -> DP::VS,
+    O: SolverObserver<DP::P, DP::VS, DP::M>,
+{
+    let mut solver = SolverState::new(root_package.clone(), root_version.clone());
+    force_terms(&mut solver, root_package, root_version, required_terms);
+    let mut solutions = Vec::new();
+    let mut run = 0;
 
     loop {
         run += 1;
@@ -517,16 +730,16 @@ where
         }
 
         loop {
-            validate_version_ordering(&solution, &maximized_packages, &version_ordering)?;
-            let Some(dominating) = find_dominating_solution(
-                dependency_provider,
-                &package,
-                &root_version,
-                &solution,
-                &maximized_packages,
-                &version_ordering,
-                observer,
-            )?
+            validate_version_ordering(&solution, maximized_packages, version_ordering)?;
+            let context = DominatingContext {
+                root_package,
+                root_version,
+                maximized_packages,
+                ordering: version_ordering,
+                required_terms,
+            };
+            let Some(dominating) =
+                find_dominating_solution(dependency_provider, &solution, &context, observer)?
             else {
                 break;
             };
@@ -578,6 +791,96 @@ where
     }
 }
 
+fn preference_satisfaction<DP: DependencyProvider>(
+    solution: &SelectedDependencies<DP::P, DP::V>,
+    preferences: &[PackagePreference<DP::P, DP::VS>],
+) -> Vec<bool> {
+    preferences
+        .iter()
+        .map(|preference| match solution.get(&preference.package) {
+            Some(version) => preference.preferred.contains(version),
+            None => matches!(preference.preferred, Term::Negative(_)),
+        })
+        .collect()
+}
+
+fn find_preference_dominating_solution<DP, O>(
+    dependency_provider: &DP,
+    root_package: &DP::P,
+    root_version: &DP::V,
+    solution: &SelectedDependencies<DP::P, DP::V>,
+    preferences: &[PackagePreference<DP::P, DP::VS>],
+    observer: &mut O,
+) -> DominatingSolutionResult<DP>
+where
+    DP: DependencyProvider,
+    O: SolverObserver<DP::P, DP::VS, DP::M>,
+{
+    let satisfaction = preference_satisfaction::<DP>(solution, preferences);
+    let preserved = preferences
+        .iter()
+        .zip(&satisfaction)
+        .filter(|(_, satisfied)| **satisfied)
+        .map(|(preference, _)| (preference.package.clone(), preference.preferred.clone()))
+        .collect::<Vec<_>>();
+    for (preference, satisfied) in preferences.iter().zip(&satisfaction) {
+        if *satisfied {
+            continue;
+        }
+        let mut probe = SolverState::new(root_package.clone(), root_version.clone());
+        force_terms(&mut probe, root_package, root_version, &preserved);
+        force_terms(
+            &mut probe,
+            root_package,
+            root_version,
+            &[(preference.package.clone(), preference.preferred.clone())],
+        );
+        observer.on_event(SolverEvent::MaximalityProbeStarted {
+            package: &preference.package,
+        });
+        let result = probe.run_until_solution(dependency_provider, &mut NoopSolverObserver);
+        let probe_result = match &result {
+            Ok(_) => crate::MaximalityProbeResult::Improved,
+            Err(PubGrubError::NoSolution(_)) => crate::MaximalityProbeResult::NoImprovement,
+            Err(_) => crate::MaximalityProbeResult::Error,
+        };
+        observer.on_event(SolverEvent::MaximalityProbeFinished {
+            package: &preference.package,
+            result: probe_result,
+        });
+        match result {
+            Ok(solution) => return Ok(Some(solution)),
+            Err(PubGrubError::NoSolution(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+fn force_terms<DP: DependencyProvider>(
+    solver: &mut SolverState<DP>,
+    root_package: &DP::P,
+    root_version: &DP::V,
+    required_terms: &[(DP::P, Term<DP::VS>)],
+) {
+    let root_term = || {
+        (
+            root_package.clone(),
+            Term::Positive(DP::VS::singleton(root_version.clone())),
+        )
+    };
+    for (package, required) in required_terms {
+        if required == &Term::any() {
+            continue;
+        }
+        if required == &Term::empty() {
+            solver.add_solution_exclusion([root_term()]);
+            continue;
+        }
+        solver.add_solution_exclusion([root_term(), (package.clone(), required.negate())]);
+    }
+}
+
 struct BorrowedVersionOrdering<'a, E, R, F> {
     same_version: &'a E,
     same_precedence: &'a R,
@@ -626,13 +929,18 @@ where
     Ok(())
 }
 
+struct DominatingContext<'a, DP: DependencyProvider, E, R, F> {
+    root_package: &'a DP::P,
+    root_version: &'a DP::V,
+    maximized_packages: &'a [DP::P],
+    ordering: &'a BorrowedVersionOrdering<'a, E, R, F>,
+    required_terms: &'a [(DP::P, Term<DP::VS>)],
+}
+
 fn find_dominating_solution<DP, E, R, F, O>(
     dependency_provider: &DP,
-    root_package: &DP::P,
-    root_version: &DP::V,
     solution: &SelectedDependencies<DP::P, DP::V>,
-    maximized_packages: &[DP::P],
-    ordering: &BorrowedVersionOrdering<'_, E, R, F>,
+    context: &DominatingContext<'_, DP, E, R, F>,
     observer: &mut O,
 ) -> DominatingSolutionResult<DP>
 where
@@ -642,26 +950,37 @@ where
     F: Fn(&DP::V) -> DP::VS,
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
-    for candidate in maximized_packages {
+    for candidate in context.maximized_packages {
         if solution.get(candidate).is_none() {
             continue;
         }
-        let mut probe = SolverState::new(root_package.clone(), root_version.clone());
+        let mut probe =
+            SolverState::new(context.root_package.clone(), context.root_version.clone());
+        force_terms(
+            &mut probe,
+            context.root_package,
+            context.root_version,
+            context.required_terms,
+        );
         let root_term = || {
             (
-                root_package.clone(),
-                Term::Positive(DP::VS::singleton(root_version.clone())),
+                context.root_package.clone(),
+                Term::Positive(DP::VS::singleton(context.root_version.clone())),
             )
         };
 
         for (selected, version) in solution.iter() {
-            if selected == root_package || !maximized_packages.contains(selected) {
+            if selected == context.root_package || !context.maximized_packages.contains(selected) {
                 continue;
             }
             let required = if selected == candidate {
-                (ordering.strictly_higher)(version)
+                (context.ordering.strictly_higher)(version)
             } else {
-                (ordering.same_precedence)(version).union(&(ordering.strictly_higher)(version))
+                (context.ordering.same_precedence)(version).union(&(context
+                    .ordering
+                    .strictly_higher)(
+                    version
+                ))
             };
             probe.add_solution_exclusion([
                 root_term(),
