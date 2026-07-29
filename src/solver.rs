@@ -55,6 +55,24 @@ pub struct SelectedDependencies<P: Package, V>(Map<P, V>);
 /// All Pareto-maximal solutions returned by [`resolve_maximal_solutions`].
 pub type MaximalSolutions<P, V> = Vec<SelectedDependencies<P, V>>;
 
+/// Caller-defined identity and precedence classes used by Pareto enumeration.
+pub struct VersionOrdering<E, R, F> {
+    same_version: E,
+    same_precedence: R,
+    strictly_higher: F,
+}
+
+impl<E, R, F> VersionOrdering<E, R, F> {
+    /// Construct identity, equal-precedence, and strictly-higher version-set mappings.
+    pub fn new(same_version: E, same_precedence: R, strictly_higher: F) -> Self {
+        Self {
+            same_version,
+            same_precedence,
+            strictly_higher,
+        }
+    }
+}
+
 type DominatingSolutionResult<DP> = Result<
     Option<SelectedDependencies<<DP as DependencyProvider>::P, <DP as DependencyProvider>::V>>,
     PubGrubError<DP>,
@@ -399,18 +417,17 @@ where
 
 /// Finds the complete Pareto front of the selected package versions.
 ///
-/// `same_version` maps a selected provider version to every provider version representing the same
-/// package version. `strictly_higher` maps it to the set of versions that count as an upgrade. The
-/// package iterator defines both the user-visible solution coordinates and the packages considered
-/// for upgrades. A solution is retained exactly when there is no other feasible solution in which
-/// every selected projected package is equivalent or higher and at least one is strictly higher.
-/// Packages outside that projection may change and do not make two projected solutions distinct.
+/// `same_version` maps a selected provider version to representations that are the same selectable
+/// realization. `same_precedence` maps it to every representation with the same ordering rank, and
+/// `strictly_higher` maps it to the set of versions that count as an upgrade. A realization is
+/// retained when its rank vector is Pareto-maximal; distinct `same_version` classes at the same
+/// maximal rank are all returned. Packages outside the projection may change and do not make two
+/// projected solutions distinct.
 ///
-/// For every selected version, `same_version` must contain that version and must be disjoint from
-/// `strictly_higher`; `strictly_higher` must not contain the selected version. The solver validates
-/// these conditions so an invalid ordering cannot make enumeration repeat the same solution
-/// forever. Use [`VersionSet::singleton`] when provider versions have no representation identity
-/// separate from their package version.
+/// For every selected version, both equivalence sets must contain that version, `same_version` must
+/// be a subset of `same_precedence`, and `same_precedence` must be disjoint from
+/// `strictly_higher`. The solver validates these conditions so an invalid ordering cannot make
+/// enumeration repeat a solution forever.
 ///
 /// Each retained point excludes the complete region it dominates, rather than only its exact
 /// projection. Enumeration is therefore driven by the size and shape of the Pareto and co-Pareto
@@ -418,18 +435,18 @@ where
 /// dependency provider's [`should_cancel`](DependencyProvider::should_cancel) hook remains active
 /// throughout both enumeration and maximality checks.
 #[cold]
-pub fn resolve_maximal_solutions<DP, I, E, F>(
+pub fn resolve_maximal_solutions<DP, I, E, R, F>(
     dependency_provider: &DP,
     package: DP::P,
     version: impl Into<DP::V>,
     maximized_packages: I,
-    same_version: E,
-    strictly_higher: F,
+    version_ordering: VersionOrdering<E, R, F>,
 ) -> Result<MaximalSolutions<DP::P, DP::V>, PubGrubError<DP>>
 where
     DP: DependencyProvider,
     I: IntoIterator<Item = DP::P>,
     E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
     F: Fn(&DP::V) -> DP::VS,
 {
     resolve_maximal_solutions_with_observer(
@@ -437,8 +454,7 @@ where
         package,
         version,
         maximized_packages,
-        same_version,
-        strictly_higher,
+        version_ordering,
         &mut NoopSolverObserver,
     )
 }
@@ -450,19 +466,19 @@ where
 /// probe becomes the path of the improved candidate; a failed probe does not. Probe boundaries and
 /// outcomes let stateful observers commit or roll back the enclosed events accordingly.
 #[cold]
-pub fn resolve_maximal_solutions_with_observer<DP, I, E, F, O>(
+pub fn resolve_maximal_solutions_with_observer<DP, I, E, R, F, O>(
     dependency_provider: &DP,
     package: DP::P,
     version: impl Into<DP::V>,
     maximized_packages: I,
-    same_version: E,
-    strictly_higher: F,
+    version_ordering: VersionOrdering<E, R, F>,
     observer: &mut O,
 ) -> Result<MaximalSolutions<DP::P, DP::V>, PubGrubError<DP>>
 where
     DP: DependencyProvider,
     I: IntoIterator<Item = DP::P>,
     E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
     F: Fn(&DP::V) -> DP::VS,
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
@@ -476,9 +492,10 @@ where
     let mut solver = SolverState::new(package.clone(), root_version.clone());
     let mut solutions = Vec::new();
     let mut run = 0;
-    let version_ordering = VersionOrdering {
-        same_version: &same_version,
-        strictly_higher: &strictly_higher,
+    let version_ordering = BorrowedVersionOrdering {
+        same_version: &version_ordering.same_version,
+        same_precedence: &version_ordering.same_precedence,
+        strictly_higher: &version_ordering.strictly_higher,
     };
 
     loop {
@@ -517,37 +534,65 @@ where
         }
 
         observer.on_event(SolverEvent::Solution);
-        let exclusion = solution
+        let exact_exclusion = solution
             .iter()
             .filter(|(selected, _)| maximized_packages.contains(selected))
             .map(|(selected, version)| {
                 (
                     selected.clone(),
-                    Term::Negative((version_ordering.strictly_higher)(version)),
+                    Term::Positive((version_ordering.same_version)(version)),
                 )
             })
             .collect::<Vec<_>>();
         solutions.push(solution);
 
-        if !solver.add_solution_exclusion(exclusion) {
+        if !solver.add_solution_exclusion(exact_exclusion) {
             return Ok(solutions);
+        }
+        let retained = solutions.last().expect("a solution was just retained");
+        for (lower_package, lower_version) in retained
+            .iter()
+            .filter(|(selected, _)| maximized_packages.contains(selected))
+        {
+            let not_lower = (version_ordering.same_precedence)(lower_version)
+                .union(&(version_ordering.strictly_higher)(lower_version));
+            let lower = not_lower.complement();
+            let dominated = retained
+                .iter()
+                .filter(|(selected, _)| maximized_packages.contains(selected))
+                .map(|(selected, version)| {
+                    if selected == lower_package {
+                        (selected.clone(), Term::Positive(lower.clone()))
+                    } else {
+                        (
+                            selected.clone(),
+                            Term::Negative((version_ordering.strictly_higher)(version)),
+                        )
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !dominated.is_empty() {
+                solver.add_solution_exclusion(dominated);
+            }
         }
     }
 }
 
-struct VersionOrdering<'a, E, F> {
+struct BorrowedVersionOrdering<'a, E, R, F> {
     same_version: &'a E,
+    same_precedence: &'a R,
     strictly_higher: &'a F,
 }
 
-fn validate_version_ordering<DP, E, F>(
+fn validate_version_ordering<DP, E, R, F>(
     solution: &SelectedDependencies<DP::P, DP::V>,
     maximized_packages: &[DP::P],
-    ordering: &VersionOrdering<'_, E, F>,
+    ordering: &BorrowedVersionOrdering<'_, E, R, F>,
 ) -> Result<(), PubGrubError<DP>>
 where
     DP: DependencyProvider,
     E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
     F: Fn(&DP::V) -> DP::VS,
 {
     for (package, version) in solution
@@ -555,13 +600,18 @@ where
         .filter(|(package, _)| maximized_packages.contains(package))
     {
         let equivalent = (ordering.same_version)(version);
+        let same_precedence = (ordering.same_precedence)(version);
         let higher = (ordering.strictly_higher)(version);
         let reason = if !equivalent.contains(version) {
             Some("same_version must contain the selected version")
+        } else if !same_precedence.contains(version) {
+            Some("same_precedence must contain the selected version")
+        } else if !equivalent.subset_of(&same_precedence) {
+            Some("same_version must be a subset of same_precedence")
         } else if higher.contains(version) {
             Some("strictly_higher must not contain the selected version")
-        } else if !equivalent.is_disjoint(&higher) {
-            Some("same_version and strictly_higher must be disjoint")
+        } else if !same_precedence.is_disjoint(&higher) {
+            Some("same_precedence and strictly_higher must be disjoint")
         } else {
             None
         };
@@ -576,18 +626,19 @@ where
     Ok(())
 }
 
-fn find_dominating_solution<DP, E, F, O>(
+fn find_dominating_solution<DP, E, R, F, O>(
     dependency_provider: &DP,
     root_package: &DP::P,
     root_version: &DP::V,
     solution: &SelectedDependencies<DP::P, DP::V>,
     maximized_packages: &[DP::P],
-    ordering: &VersionOrdering<'_, E, F>,
+    ordering: &BorrowedVersionOrdering<'_, E, R, F>,
     observer: &mut O,
 ) -> DominatingSolutionResult<DP>
 where
     DP: DependencyProvider,
     E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
     F: Fn(&DP::V) -> DP::VS,
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
@@ -610,7 +661,7 @@ where
             let required = if selected == candidate {
                 (ordering.strictly_higher)(version)
             } else {
-                (ordering.same_version)(version).union(&(ordering.strictly_higher)(version))
+                (ordering.same_precedence)(version).union(&(ordering.strictly_higher)(version))
             };
             probe.add_solution_exclusion([
                 root_term(),

@@ -16,6 +16,8 @@ All notable changes to this project will be documented in this file.
   identity, and reject invalid equivalence/ordering callbacks before they can repeat a solution.
 - Exclude the complete region dominated by each retained Pareto point, and expose transactional
   probe outcomes so observers retain the actual successful improvement path.
+- Separate selectable-version identity from ordering precedence so distinct realizations at the
+  same Pareto rank can be returned without re-enumerating strictly dominated regions.
 
 ## 0.4.0 - 2026-04-09
 

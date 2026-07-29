@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use pubgrub::{
-    OfflineDependencyProvider, Ranges, SolverEvent, SolverObserver, resolve_maximal_solutions,
-    resolve_maximal_solutions_with_observer,
+    OfflineDependencyProvider, Ranges, SolverEvent, SolverObserver, VersionOrdering,
+    resolve_maximal_solutions, resolve_maximal_solutions_with_observer,
 };
 
 type Provider = OfflineDependencyProvider<&'static str, Ranges<u32>>;
@@ -28,8 +28,11 @@ fn enumerate(provider: &Provider) -> BTreeSet<(u32, u32)> {
             "root",
             1u32,
             ["a", "b"],
-            |version| Ranges::singleton(*version),
-            |version| Ranges::strictly_higher_than(*version),
+            VersionOrdering::new(
+                |version: &u32| Ranges::singleton(*version),
+                |version: &u32| Ranges::singleton(*version),
+                |version: &u32| Ranges::strictly_higher_than(*version),
+            ),
         )
         .unwrap(),
     )
@@ -112,8 +115,11 @@ fn observer_reports_only_retained_solutions() {
         "root",
         1u32,
         ["a", "b"],
-        |version| Ranges::singleton(*version),
-        |version| Ranges::strictly_higher_than(*version),
+        VersionOrdering::new(
+            |version: &u32| Ranges::singleton(*version),
+            |version: &u32| Ranges::singleton(*version),
+            |version: &u32| Ranges::strictly_higher_than(*version),
+        ),
         &mut observer,
     )
     .unwrap();
@@ -140,8 +146,11 @@ fn packages_outside_the_projection_may_change_during_an_upgrade() {
         "root",
         1u32,
         ["a"],
-        |version| Ranges::singleton(*version),
-        |version| Ranges::strictly_higher_than(*version),
+        VersionOrdering::new(
+            |version: &u32| Ranges::singleton(*version),
+            |version: &u32| Ranges::singleton(*version),
+            |version: &u32| Ranges::strictly_higher_than(*version),
+        ),
     )
     .unwrap();
 
@@ -185,28 +194,110 @@ fn equivalent_provider_versions_do_not_multiply_projected_solutions() {
         "root",
         root,
         ["a", "b"],
-        |selected| {
-            Ranges::between(
-                Realization {
-                    version: selected.version,
-                    source: 0,
-                },
-                Realization {
+        VersionOrdering::new(
+            |selected: &Realization| {
+                Ranges::between(
+                    Realization {
+                        version: selected.version,
+                        source: 0,
+                    },
+                    Realization {
+                        version: selected.version + 1,
+                        source: 0,
+                    },
+                )
+            },
+            |selected: &Realization| {
+                Ranges::between(
+                    Realization {
+                        version: selected.version,
+                        source: 0,
+                    },
+                    Realization {
+                        version: selected.version + 1,
+                        source: 0,
+                    },
+                )
+            },
+            |selected: &Realization| {
+                Ranges::higher_than(Realization {
                     version: selected.version + 1,
                     source: 0,
-                },
-            )
-        },
-        |selected| {
-            Ranges::higher_than(Realization {
-                version: selected.version + 1,
-                source: 0,
-            })
-        },
+                })
+            },
+        ),
     )
     .unwrap();
 
     assert_eq!(solutions.len(), 1);
+}
+
+#[test]
+fn distinct_realizations_at_the_same_maximal_precedence_are_all_returned() {
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct Realization {
+        precedence: u32,
+        source: u32,
+    }
+
+    impl std::fmt::Display for Realization {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{} from {}", self.precedence, self.source)
+        }
+    }
+
+    type RealizationProvider = OfflineDependencyProvider<&'static str, Ranges<Realization>>;
+    let mut provider = RealizationProvider::new();
+    let root = Realization {
+        precedence: 0,
+        source: 0,
+    };
+    provider.add_dependencies("root", root.clone(), [("a", Ranges::full())]);
+    for source in 1..=3 {
+        provider.add_dependencies(
+            "a",
+            Realization {
+                precedence: 1,
+                source,
+            },
+            [],
+        );
+    }
+
+    let solutions = resolve_maximal_solutions(
+        &provider,
+        "root",
+        root,
+        ["a"],
+        VersionOrdering::new(
+            |selected: &Realization| Ranges::singleton(selected.clone()),
+            |selected: &Realization| {
+                Ranges::between(
+                    Realization {
+                        precedence: selected.precedence,
+                        source: 0,
+                    },
+                    Realization {
+                        precedence: selected.precedence + 1,
+                        source: 0,
+                    },
+                )
+            },
+            |selected: &Realization| {
+                Ranges::higher_than(Realization {
+                    precedence: selected.precedence + 1,
+                    source: 0,
+                })
+            },
+        ),
+    )
+    .unwrap();
+    let sources: BTreeSet<_> = solutions
+        .iter()
+        .map(|solution| solution.get(&"a").unwrap().source)
+        .collect();
+
+    assert_eq!(sources, BTreeSet::from([1, 2, 3]));
 }
 
 #[test]
@@ -220,8 +311,11 @@ fn invalid_strictly_higher_callback_is_rejected_instead_of_repeating() {
         "root",
         1u32,
         ["a"],
-        |version| Ranges::singleton(*version),
-        |version| Ranges::higher_than(*version),
+        VersionOrdering::new(
+            |version: &u32| Ranges::singleton(*version),
+            |version: &u32| Ranges::singleton(*version),
+            |version: &u32| Ranges::higher_than(*version),
+        ),
     )
     .unwrap_err();
 

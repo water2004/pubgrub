@@ -117,14 +117,12 @@ new retained path; a failed probe can be rolled back by a stateful observer.
 Enumeration clauses have their own `ExcludedSolution` reason, so they cannot
 be mistaken for provider dependency metadata.
 
-The caller supplies the packages to maximize, a function constructing the
-same-package-version equivalence range, and a function constructing the
-strictly-higher version range. The equivalence range lets applications keep a
-source or artifact identity in the provider version without multiplying
-user-visible solutions. The solver rejects callbacks when the equivalence
-range omits the selected version, overlaps the strictly-higher range, or the
-strictly-higher range contains the selected version; this guarantees that each
-enumeration exclusion removes the solution that produced it.
+The caller supplies the packages to maximize and three version-set functions:
+the same selectable realization, every realization at the same ordering
+precedence, and every strictly higher version. This lets applications choose
+whether multiple sources are one realization while still returning distinct
+realizations that share a Pareto rank. The solver validates containment and
+disjointness between these sets before adding enumeration clauses.
 
 The Pareto or co-Pareto front can still be large;
 `DependencyProvider::should_cancel` is checked throughout enumeration.
