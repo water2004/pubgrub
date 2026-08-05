@@ -991,50 +991,124 @@ where
     DP: DependencyProvider,
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
-    let mut preference_solver = SolverState::new(root_package.clone(), root_version.clone());
-    let mut satisfaction_front = Vec::new();
+    let mut pending: Vec<(Vec<bool>, Option<usize>)> = vec![(vec![false; preferences.len()], None)];
+    let mut visited = Set::new();
+    let mut minimal_removals: Set<Vec<usize>> = Set::new();
+    let mut first_failure = None;
     let mut run = 0;
-    loop {
+    while let Some((removed, branch_preference)) = pending.pop() {
+        let removal_indices = removed
+            .iter()
+            .enumerate()
+            .filter_map(|(index, removed)| removed.then_some(index))
+            .collect::<Vec<_>>();
+        if !visited.insert(removal_indices.clone())
+            || minimal_removals
+                .iter()
+                .any(|known| is_index_subset(known, &removal_indices))
+        {
+            continue;
+        }
+        let required_terms = preferences
+            .iter()
+            .zip(&removed)
+            .map(|(preference, removed)| {
+                (
+                    preference.package.clone(),
+                    if *removed {
+                        preference.preferred.negate()
+                    } else {
+                        preference.preferred.clone()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut solver = SolverState::new(root_package.clone(), root_version.clone());
+        force_terms(&mut solver, root_package, root_version, &required_terms);
         run += 1;
         observer.on_event(SolverEvent::EnumerationRunStarted { run });
-        let result =
-            preference_solver.run_until_solution(dependency_provider, &mut NoopSolverObserver);
+        if let Some(index) = branch_preference {
+            observer.on_event(SolverEvent::PreferenceProbeStarted {
+                package: &preferences[index].package,
+            });
+        }
+        let result = solver.run_until_solution(dependency_provider, &mut NoopSolverObserver);
+        if let Some(index) = branch_preference {
+            observer.on_event(SolverEvent::PreferenceProbeFinished {
+                package: &preferences[index].package,
+                result: match &result {
+                    Ok(_) => crate::MaximalityProbeResult::Improved,
+                    Err(PubGrubError::NoSolution(_)) => crate::MaximalityProbeResult::NoImprovement,
+                    Err(_) => crate::MaximalityProbeResult::Error,
+                },
+            });
+        }
         observer.on_event(SolverEvent::EnumerationRunFinished { run });
-        let mut solution = match result {
-            Ok(solution) => solution,
-            Err(PubGrubError::NoSolution(reason)) if satisfaction_front.is_empty() => {
-                return Err(PubGrubError::NoSolution(reason));
+        match result {
+            Ok(_) => {
+                minimal_removals.retain(|known| !is_index_subset(&removal_indices, known));
+                minimal_removals.insert(removal_indices);
             }
-            Err(PubGrubError::NoSolution(_)) => return Ok(satisfaction_front),
+            Err(PubGrubError::NoSolution(reason)) => {
+                if first_failure.is_none() {
+                    first_failure = Some(reason.clone());
+                }
+                let mut forced_packages = PackageSet::default();
+                collect_forced_packages(&reason, &mut forced_packages);
+                let branch_candidates = preferences
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, preference)| {
+                        !removed[*index] && forced_packages.contains(&preference.package)
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                for index in branch_candidates.into_iter().rev() {
+                    let mut descendant = removed.clone();
+                    descendant[index] = true;
+                    pending.push((descendant, Some(index)));
+                }
+            }
             Err(error) => return Err(error),
-        };
-        let mut failed_preferences = vec![false; preferences.len()];
-        loop {
-            let Some(improved) = find_preference_dominating_solution(
-                dependency_provider,
-                root_package,
-                root_version,
-                &solution,
-                preferences,
-                &mut failed_preferences,
-                observer,
-            )?
-            else {
-                break;
-            };
-            solution = improved;
         }
-        let satisfaction = preference_satisfaction::<DP>(&solution, preferences);
-        let dominated_preference_region = preferences
-            .iter()
-            .zip(&satisfaction)
-            .filter(|(_, satisfied)| !**satisfied)
-            .map(|(preference, _)| (preference.package.clone(), preference.preferred.negate()))
-            .collect::<Vec<_>>();
-        satisfaction_front.push(satisfaction);
-        if !preference_solver.add_solution_exclusion(dominated_preference_region) {
-            return Ok(satisfaction_front);
+    }
+    if minimal_removals.is_empty() {
+        return Err(PubGrubError::NoSolution(
+            first_failure.expect("at least one preference solve was attempted"),
+        ));
+    }
+    Ok(minimal_removals
+        .into_iter()
+        .map(|removed| {
+            let removed = removed.into_iter().collect::<PackageSet<_>>();
+            (0..preferences.len())
+                .map(|index| !removed.contains(&index))
+                .collect()
+        })
+        .collect())
+}
+
+fn is_index_subset(left: &[usize], right: &[usize]) -> bool {
+    left.iter().all(|index| right.binary_search(index).is_ok())
+}
+
+fn collect_forced_packages<P, VS, M>(
+    tree: &crate::DerivationTree<P, VS, M>,
+    packages: &mut PackageSet<P>,
+) where
+    P: Package,
+    VS: VersionSet,
+    M: Eq + Clone + Debug + Display,
+{
+    match tree {
+        crate::DerivationTree::External(crate::External::ExcludedSolution { terms }) => {
+            packages.extend(terms.keys().cloned());
         }
+        crate::DerivationTree::Derived(derived) => {
+            collect_forced_packages(&derived.cause1, packages);
+            collect_forced_packages(&derived.cause2, packages);
+        }
+        crate::DerivationTree::External(_) => {}
     }
 }
 
@@ -1137,73 +1211,6 @@ where
             }
         }
     }
-}
-
-fn preference_satisfaction<DP: DependencyProvider>(
-    solution: &SelectedDependencies<DP::P, DP::V>,
-    preferences: &[PackagePreference<DP::P, DP::VS>],
-) -> Vec<bool> {
-    preferences
-        .iter()
-        .map(|preference| match solution.get(&preference.package) {
-            Some(version) => preference.preferred.contains(version),
-            None => matches!(preference.preferred, Term::Negative(_)),
-        })
-        .collect()
-}
-
-fn find_preference_dominating_solution<DP, O>(
-    dependency_provider: &DP,
-    root_package: &DP::P,
-    root_version: &DP::V,
-    solution: &SelectedDependencies<DP::P, DP::V>,
-    preferences: &[PackagePreference<DP::P, DP::VS>],
-    failed_preferences: &mut [bool],
-    observer: &mut O,
-) -> DominatingSolutionResult<DP>
-where
-    DP: DependencyProvider,
-    O: SolverObserver<DP::P, DP::VS, DP::M>,
-{
-    let satisfaction = preference_satisfaction::<DP>(solution, preferences);
-    let preserved = preferences
-        .iter()
-        .zip(&satisfaction)
-        .filter(|(_, satisfied)| **satisfied)
-        .map(|(preference, _)| (preference.package.clone(), preference.preferred.clone()))
-        .collect::<Vec<_>>();
-    for (index, (preference, satisfied)) in preferences.iter().zip(&satisfaction).enumerate() {
-        if *satisfied || failed_preferences[index] {
-            continue;
-        }
-        let mut probe = SolverState::new(root_package.clone(), root_version.clone());
-        force_terms(&mut probe, root_package, root_version, &preserved);
-        force_terms(
-            &mut probe,
-            root_package,
-            root_version,
-            &[(preference.package.clone(), preference.preferred.clone())],
-        );
-        observer.on_event(SolverEvent::PreferenceProbeStarted {
-            package: &preference.package,
-        });
-        let result = probe.run_until_solution(dependency_provider, &mut NoopSolverObserver);
-        let probe_result = match &result {
-            Ok(_) => crate::MaximalityProbeResult::Improved,
-            Err(PubGrubError::NoSolution(_)) => crate::MaximalityProbeResult::NoImprovement,
-            Err(_) => crate::MaximalityProbeResult::Error,
-        };
-        observer.on_event(SolverEvent::PreferenceProbeFinished {
-            package: &preference.package,
-            result: probe_result,
-        });
-        match result {
-            Ok(solution) => return Ok(Some(solution)),
-            Err(PubGrubError::NoSolution(_)) => failed_preferences[index] = true,
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(None)
 }
 
 fn force_terms<DP: DependencyProvider>(
