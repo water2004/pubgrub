@@ -2,8 +2,9 @@ use std::collections::BTreeSet;
 
 use pubgrub::{
     OfflineDependencyProvider, PackagePreference, Ranges, SolverEvent, SolverObserver,
-    VersionOrdering, resolve_maximal_solutions, resolve_maximal_solutions_with_observer,
-    resolve_minimal_change_solutions,
+    VersionOrdering, resolve_factored_preference_solutions, resolve_maximal_solutions,
+    resolve_maximal_solutions_for_preference_decisions, resolve_maximal_solutions_with_observer,
+    resolve_minimal_change_solutions, resolve_minimal_change_solutions_with_observer,
 };
 
 type Provider = OfflineDependencyProvider<&'static str, Ranges<u32>>;
@@ -20,6 +21,116 @@ fn projected(
             )
         })
         .collect()
+}
+
+#[derive(Default)]
+struct PreferenceProbeCounter {
+    impossible_started: usize,
+}
+
+impl SolverObserver<&'static str, Ranges<u32>, String> for PreferenceProbeCounter {
+    fn on_event(&mut self, event: SolverEvent<'_, &'static str, Ranges<u32>, String>) {
+        if let SolverEvent::PreferenceProbeStarted { package } = event {
+            if *package == "impossible" {
+                self.impossible_started += 1;
+            }
+        }
+    }
+
+    fn captures_derivation_trees(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn failed_preference_is_not_retried_while_the_preserved_set_only_grows() {
+    let mut provider = Provider::new();
+    provider.add_dependencies("root", 1u32, []);
+    provider.add_dependencies("b", 1u32, []);
+    provider.add_dependencies("c", 1u32, []);
+
+    let mut observer = PreferenceProbeCounter::default();
+    let solutions = resolve_minimal_change_solutions_with_observer(
+        &provider,
+        "root",
+        1u32,
+        [
+            PackagePreference::selected("impossible", Ranges::singleton(1u32)),
+            PackagePreference::selected("b", Ranges::singleton(1u32)),
+            PackagePreference::selected("c", Ranges::singleton(1u32)),
+        ],
+        ["b", "c"],
+        ordering(),
+        &mut observer,
+    )
+    .unwrap();
+
+    assert_eq!(observer.impossible_started, 1);
+    assert_eq!(solutions.len(), 1);
+    assert_eq!(solutions[0].get(&"b"), Some(&1));
+    assert_eq!(solutions[0].get(&"c"), Some(&1));
+}
+
+#[test]
+fn independent_preference_fronts_are_returned_as_a_product_of_factors() {
+    let mut provider = Provider::new();
+    provider.add_dependencies("root", 1u32, []);
+    provider.add_dependencies("a1", 1u32, [("gate-a", Ranges::singleton(1u32))]);
+    provider.add_dependencies("a2", 1u32, [("gate-a", Ranges::singleton(2u32))]);
+    provider.add_dependencies("b1", 1u32, [("gate-b", Ranges::singleton(1u32))]);
+    provider.add_dependencies("b2", 1u32, [("gate-b", Ranges::singleton(2u32))]);
+    for gate in ["gate-a", "gate-b"] {
+        provider.add_dependencies(gate, 1u32, []);
+        provider.add_dependencies(gate, 2u32, []);
+    }
+
+    let factored = resolve_factored_preference_solutions(
+        &provider,
+        "root",
+        1u32,
+        vec![
+            vec![
+                PackagePreference::selected("a1", Ranges::singleton(1u32)),
+                PackagePreference::selected("a2", Ranges::singleton(1u32)),
+            ],
+            vec![
+                PackagePreference::selected("b1", Ranges::singleton(1u32)),
+                PackagePreference::selected("b2", Ranges::singleton(1u32)),
+            ],
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(factored.common(), []);
+    assert_eq!(factored.factors().len(), 2);
+    assert!(
+        factored
+            .factors()
+            .iter()
+            .all(|factor| factor.alternatives().len() == 2)
+    );
+    assert_eq!(factored.complete_assignment_count(), Some(4));
+
+    let decisions = factored.decisions_for(&[0, 1]).unwrap();
+    let solutions = resolve_maximal_solutions_for_preference_decisions(
+        &provider,
+        "root",
+        1u32,
+        decisions,
+        std::iter::empty::<&'static str>(),
+        ordering(),
+    )
+    .unwrap();
+    assert_eq!(solutions.len(), 1);
+    let selected_a = ["a1", "a2"]
+        .into_iter()
+        .filter(|package| solutions[0].get(package).is_some())
+        .count();
+    let selected_b = ["b1", "b2"]
+        .into_iter()
+        .filter(|package| solutions[0].get(package).is_some())
+        .count();
+    assert_eq!((selected_a, selected_b), (1, 1));
 }
 
 fn enumerate(provider: &Provider) -> BTreeSet<(u32, u32)> {

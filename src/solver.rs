@@ -89,6 +89,125 @@ impl<P: Package, VS: VersionSet> PackagePreference<P, VS> {
             preferred: Term::Negative(VS::full()),
         }
     }
+
+    /// Package whose state this preference describes.
+    pub fn package(&self) -> &P {
+        &self.package
+    }
+
+    /// Term which is satisfied when the preferred state is preserved.
+    pub fn preferred(&self) -> &Term<VS> {
+        &self.preferred
+    }
+}
+
+/// One fixed truth value for a soft package-state preference.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PreferenceDecision<P: Package, VS: VersionSet> {
+    preference: PackagePreference<P, VS>,
+    satisfied: bool,
+}
+
+impl<P: Package, VS: VersionSet> PreferenceDecision<P, VS> {
+    fn new(preference: PackagePreference<P, VS>, satisfied: bool) -> Self {
+        Self {
+            preference,
+            satisfied,
+        }
+    }
+
+    /// Preference whose truth value was fixed.
+    pub fn preference(&self) -> &PackagePreference<P, VS> {
+        &self.preference
+    }
+
+    /// Whether the preferred state must be satisfied.
+    pub fn is_satisfied(&self) -> bool {
+        self.satisfied
+    }
+}
+
+/// One Pareto-maximal assignment inside an independent preference factor.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PreferenceAlternative<P: Package, VS: VersionSet> {
+    decisions: Vec<PreferenceDecision<P, VS>>,
+}
+
+impl<P: Package, VS: VersionSet> PreferenceAlternative<P, VS> {
+    /// Decisions which distinguish this alternative from its siblings.
+    pub fn decisions(&self) -> &[PreferenceDecision<P, VS>] {
+        &self.decisions
+    }
+}
+
+/// Mutually exclusive alternatives for one independent preference component.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PreferenceFactor<P: Package, VS: VersionSet> {
+    alternatives: Vec<PreferenceAlternative<P, VS>>,
+}
+
+impl<P: Package, VS: VersionSet> PreferenceFactor<P, VS> {
+    /// Pareto-maximal alternatives available for this factor.
+    pub fn alternatives(&self) -> &[PreferenceAlternative<P, VS>] {
+        &self.alternatives
+    }
+}
+
+/// A compact product of independent Pareto-maximal preference choices.
+///
+/// Every decision in [`common`](Self::common) applies to every complete assignment. A complete
+/// assignment then selects exactly one alternative from each factor. The representation therefore
+/// grows with the sum of independent alternatives rather than their Cartesian product.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FactoredPreferenceSolutions<P: Package, VS: VersionSet> {
+    common: Vec<PreferenceDecision<P, VS>>,
+    factors: Vec<PreferenceFactor<P, VS>>,
+}
+
+impl<P: Package, VS: VersionSet> FactoredPreferenceSolutions<P, VS> {
+    /// Decisions shared by every complete assignment.
+    pub fn common(&self) -> &[PreferenceDecision<P, VS>] {
+        &self.common
+    }
+
+    /// Independent factors whose alternatives form the complete solution space.
+    pub fn factors(&self) -> &[PreferenceFactor<P, VS>] {
+        &self.factors
+    }
+
+    /// Number of represented complete assignments, or `None` if the product exceeds `u128`.
+    pub fn complete_assignment_count(&self) -> Option<u128> {
+        self.factors.iter().try_fold(1u128, |count, factor| {
+            count.checked_mul(factor.alternatives.len() as u128)
+        })
+    }
+
+    /// Whether the factored space contains exactly one complete assignment.
+    pub fn is_unique(&self) -> bool {
+        self.factors.is_empty()
+    }
+
+    /// Combine the common decisions with one selected alternative per factor.
+    pub fn decisions_for(
+        &self,
+        selected_alternatives: &[usize],
+    ) -> Option<Vec<PreferenceDecision<P, VS>>> {
+        if selected_alternatives.len() != self.factors.len() {
+            return None;
+        }
+        let mut decisions = self.common.clone();
+        for (factor, selected) in self.factors.iter().zip(selected_alternatives) {
+            decisions.extend(
+                factor
+                    .alternatives
+                    .get(*selected)?
+                    .decisions
+                    .iter()
+                    .cloned(),
+            );
+        }
+        Some(decisions)
+    }
 }
 
 impl<E, R, F> VersionOrdering<E, R, F> {
@@ -601,13 +720,7 @@ where
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
     let root_version = version.into();
-    let preferences = preferences
-        .into_iter()
-        .filter(|preference| preference.package != package)
-        .filter(|preference| {
-            preference.preferred != Term::any() && preference.preferred != Term::empty()
-        })
-        .collect::<Vec<_>>();
+    let preferences = usable_preferences::<DP, _>(&package, preferences);
     let mut seen = PackageSet::default();
     let maximized_packages = maximized_packages
         .into_iter()
@@ -619,41 +732,15 @@ where
         same_precedence: &version_ordering.same_precedence,
         strictly_higher: &version_ordering.strictly_higher,
     };
-    let mut preference_solver = SolverState::new(package.clone(), root_version.clone());
     let mut solutions = Vec::new();
-    let mut run = 0;
-
-    loop {
-        run += 1;
-        observer.on_event(SolverEvent::EnumerationRunStarted { run });
-        let result =
-            preference_solver.run_until_solution(dependency_provider, &mut NoopSolverObserver);
-        observer.on_event(SolverEvent::EnumerationRunFinished { run });
-        let mut solution = match result {
-            Ok(solution) => solution,
-            Err(PubGrubError::NoSolution(reason)) if solutions.is_empty() => {
-                return Err(PubGrubError::NoSolution(reason));
-            }
-            Err(PubGrubError::NoSolution(_)) => return Ok(solutions),
-            Err(error) => return Err(error),
-        };
-
-        loop {
-            let Some(improved) = find_preference_dominating_solution(
-                dependency_provider,
-                &package,
-                &root_version,
-                &solution,
-                &preferences,
-                observer,
-            )?
-            else {
-                break;
-            };
-            solution = improved;
-        }
-
-        let satisfaction = preference_satisfaction::<DP>(&solution, &preferences);
+    let satisfaction_front = enumerate_maximal_preference_satisfactions(
+        dependency_provider,
+        &package,
+        &root_version,
+        &preferences,
+        observer,
+    )?;
+    for satisfaction in satisfaction_front {
         let fixed_preferences = preferences
             .iter()
             .zip(&satisfaction)
@@ -677,15 +764,276 @@ where
             &fixed_preferences,
             observer,
         )?);
+    }
+    Ok(solutions)
+}
 
+/// Enumerate independent preference components without expanding their Cartesian product.
+///
+/// Each inner vector must be one dependency-graph component: no selectable package or
+/// incompatibility may couple preferences in different components. PubGrub verifies every local
+/// alternative against the complete provider graph, but discovering a safe partition is the
+/// caller's responsibility because [`DependencyProvider`] intentionally does not expose its graph.
+/// When that condition holds, the product of the returned factors is exactly the global Pareto
+/// front under set-inclusion preference ordering.
+#[cold]
+pub fn resolve_factored_preference_solutions<DP>(
+    dependency_provider: &DP,
+    package: DP::P,
+    version: impl Into<DP::V>,
+    preference_components: Vec<Vec<PackagePreference<DP::P, DP::VS>>>,
+) -> Result<FactoredPreferenceSolutions<DP::P, DP::VS>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+{
+    resolve_factored_preference_solutions_with_observer(
+        dependency_provider,
+        package,
+        version,
+        preference_components,
+        &mut NoopSolverObserver,
+    )
+}
+
+/// Factored preference enumeration with observer events for all feasibility work.
+#[cold]
+pub fn resolve_factored_preference_solutions_with_observer<DP, O>(
+    dependency_provider: &DP,
+    package: DP::P,
+    version: impl Into<DP::V>,
+    preference_components: Vec<Vec<PackagePreference<DP::P, DP::VS>>>,
+    observer: &mut O,
+) -> Result<FactoredPreferenceSolutions<DP::P, DP::VS>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    O: SolverObserver<DP::P, DP::VS, DP::M>,
+{
+    let root_version = version.into();
+    let mut components = preference_components
+        .into_iter()
+        .map(|component| usable_preferences::<DP, _>(&package, component))
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    if components.is_empty() {
+        enumerate_maximal_preference_satisfactions(
+            dependency_provider,
+            &package,
+            &root_version,
+            &[],
+            observer,
+        )?;
+        return Ok(FactoredPreferenceSolutions {
+            common: Vec::new(),
+            factors: Vec::new(),
+        });
+    }
+
+    let mut common = Vec::new();
+    let mut factors = Vec::new();
+    for preferences in components.drain(..) {
+        let satisfaction_front = enumerate_maximal_preference_satisfactions(
+            dependency_provider,
+            &package,
+            &root_version,
+            &preferences,
+            observer,
+        )?;
+        let constant = (0..preferences.len())
+            .map(|index| {
+                let first = satisfaction_front[0][index];
+                satisfaction_front
+                    .iter()
+                    .all(|satisfaction| satisfaction[index] == first)
+                    .then_some(first)
+            })
+            .collect::<Vec<_>>();
+        for (index, value) in constant.iter().enumerate() {
+            if let Some(satisfied) = value {
+                common.push(PreferenceDecision::new(
+                    preferences[index].clone(),
+                    *satisfied,
+                ));
+            }
+        }
+        let mut alternatives = satisfaction_front
+            .into_iter()
+            .map(|satisfaction| PreferenceAlternative {
+                decisions: satisfaction
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(index, _)| constant[*index].is_none())
+                    .map(|(index, satisfied)| {
+                        PreferenceDecision::new(preferences[index].clone(), satisfied)
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        alternatives.dedup();
+        if alternatives.len() > 1 {
+            factors.push(PreferenceFactor { alternatives });
+        } else if let Some(alternative) = alternatives.pop() {
+            common.extend(alternative.decisions);
+        }
+    }
+    Ok(FactoredPreferenceSolutions { common, factors })
+}
+
+/// Maximize versions after a complete factored preference assignment has been selected.
+#[cold]
+pub fn resolve_maximal_solutions_for_preference_decisions<DP, DI, MI, E, R, F>(
+    dependency_provider: &DP,
+    package: DP::P,
+    version: impl Into<DP::V>,
+    decisions: DI,
+    maximized_packages: MI,
+    version_ordering: VersionOrdering<E, R, F>,
+) -> Result<MaximalSolutions<DP::P, DP::V>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    DI: IntoIterator<Item = PreferenceDecision<DP::P, DP::VS>>,
+    MI: IntoIterator<Item = DP::P>,
+    E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
+    F: Fn(&DP::V) -> DP::VS,
+{
+    resolve_maximal_solutions_for_preference_decisions_with_observer(
+        dependency_provider,
+        package,
+        version,
+        decisions,
+        maximized_packages,
+        version_ordering,
+        &mut NoopSolverObserver,
+    )
+}
+
+/// Version maximization for a selected preference assignment with observer events.
+#[cold]
+pub fn resolve_maximal_solutions_for_preference_decisions_with_observer<DP, DI, MI, E, R, F, O>(
+    dependency_provider: &DP,
+    package: DP::P,
+    version: impl Into<DP::V>,
+    decisions: DI,
+    maximized_packages: MI,
+    version_ordering: VersionOrdering<E, R, F>,
+    observer: &mut O,
+) -> Result<MaximalSolutions<DP::P, DP::V>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    DI: IntoIterator<Item = PreferenceDecision<DP::P, DP::VS>>,
+    MI: IntoIterator<Item = DP::P>,
+    E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
+    F: Fn(&DP::V) -> DP::VS,
+    O: SolverObserver<DP::P, DP::VS, DP::M>,
+{
+    let root_version = version.into();
+    let required_terms = decisions
+        .into_iter()
+        .filter(|decision| decision.preference.package != package)
+        .map(|decision| {
+            let preference = decision.preference;
+            let term = if decision.satisfied {
+                preference.preferred
+            } else {
+                preference.preferred.negate()
+            };
+            (preference.package, term)
+        })
+        .collect::<Vec<_>>();
+    let mut seen = PackageSet::default();
+    let maximized_packages = maximized_packages
+        .into_iter()
+        .filter(|candidate| candidate != &package)
+        .filter(|candidate| seen.insert(candidate.clone()))
+        .collect::<Vec<_>>();
+    let borrowed_ordering = BorrowedVersionOrdering {
+        same_version: &version_ordering.same_version,
+        same_precedence: &version_ordering.same_precedence,
+        strictly_higher: &version_ordering.strictly_higher,
+    };
+    enumerate_maximal_solutions_with_constraints(
+        dependency_provider,
+        &package,
+        &root_version,
+        &maximized_packages,
+        &borrowed_ordering,
+        &required_terms,
+        observer,
+    )
+}
+
+fn usable_preferences<DP, PI>(
+    root_package: &DP::P,
+    preferences: PI,
+) -> Vec<PackagePreference<DP::P, DP::VS>>
+where
+    DP: DependencyProvider,
+    PI: IntoIterator<Item = PackagePreference<DP::P, DP::VS>>,
+{
+    preferences
+        .into_iter()
+        .filter(|preference| &preference.package != root_package)
+        .filter(|preference| {
+            preference.preferred != Term::any() && preference.preferred != Term::empty()
+        })
+        .collect()
+}
+
+fn enumerate_maximal_preference_satisfactions<DP, O>(
+    dependency_provider: &DP,
+    root_package: &DP::P,
+    root_version: &DP::V,
+    preferences: &[PackagePreference<DP::P, DP::VS>],
+    observer: &mut O,
+) -> Result<Vec<Vec<bool>>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    O: SolverObserver<DP::P, DP::VS, DP::M>,
+{
+    let mut preference_solver = SolverState::new(root_package.clone(), root_version.clone());
+    let mut satisfaction_front = Vec::new();
+    let mut run = 0;
+    loop {
+        run += 1;
+        observer.on_event(SolverEvent::EnumerationRunStarted { run });
+        let result =
+            preference_solver.run_until_solution(dependency_provider, &mut NoopSolverObserver);
+        observer.on_event(SolverEvent::EnumerationRunFinished { run });
+        let mut solution = match result {
+            Ok(solution) => solution,
+            Err(PubGrubError::NoSolution(reason)) if satisfaction_front.is_empty() => {
+                return Err(PubGrubError::NoSolution(reason));
+            }
+            Err(PubGrubError::NoSolution(_)) => return Ok(satisfaction_front),
+            Err(error) => return Err(error),
+        };
+        let mut failed_preferences = vec![false; preferences.len()];
+        loop {
+            let Some(improved) = find_preference_dominating_solution(
+                dependency_provider,
+                root_package,
+                root_version,
+                &solution,
+                preferences,
+                &mut failed_preferences,
+                observer,
+            )?
+            else {
+                break;
+            };
+            solution = improved;
+        }
+        let satisfaction = preference_satisfaction::<DP>(&solution, preferences);
         let dominated_preference_region = preferences
             .iter()
             .zip(&satisfaction)
             .filter(|(_, satisfied)| !**satisfied)
             .map(|(preference, _)| (preference.package.clone(), preference.preferred.negate()))
             .collect::<Vec<_>>();
+        satisfaction_front.push(satisfaction);
         if !preference_solver.add_solution_exclusion(dominated_preference_region) {
-            return Ok(solutions);
+            return Ok(satisfaction_front);
         }
     }
 }
@@ -810,6 +1158,7 @@ fn find_preference_dominating_solution<DP, O>(
     root_version: &DP::V,
     solution: &SelectedDependencies<DP::P, DP::V>,
     preferences: &[PackagePreference<DP::P, DP::VS>],
+    failed_preferences: &mut [bool],
     observer: &mut O,
 ) -> DominatingSolutionResult<DP>
 where
@@ -823,8 +1172,8 @@ where
         .filter(|(_, satisfied)| **satisfied)
         .map(|(preference, _)| (preference.package.clone(), preference.preferred.clone()))
         .collect::<Vec<_>>();
-    for (preference, satisfied) in preferences.iter().zip(&satisfaction) {
-        if *satisfied {
+    for (index, (preference, satisfied)) in preferences.iter().zip(&satisfaction).enumerate() {
+        if *satisfied || failed_preferences[index] {
             continue;
         }
         let mut probe = SolverState::new(root_package.clone(), root_version.clone());
@@ -850,7 +1199,7 @@ where
         });
         match result {
             Ok(solution) => return Ok(Some(solution)),
-            Err(PubGrubError::NoSolution(_)) => {}
+            Err(PubGrubError::NoSolution(_)) => failed_preferences[index] = true,
             Err(error) => return Err(error),
         }
     }
