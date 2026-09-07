@@ -1073,6 +1073,22 @@ where
         }
     }
     if minimal_removals.is_empty() {
+        // No preference assignment is satisfiable. Any solution of the
+        // unconstrained problem would satisfy one explored branch (force the
+        // preferences it satisfies, negate the others), so the dependency
+        // graph itself must already be unsatisfiable. Re-solve once without
+        // any forced preference term: its failure tree contains only genuine
+        // dependency facts instead of blaming preference-forcing clauses.
+        if !preferences.is_empty() {
+            let mut solver = SolverState::new(root_package.clone(), root_version.clone());
+            run += 1;
+            observer.on_event(SolverEvent::EnumerationRunStarted { run });
+            let result = solver.run_until_solution(dependency_provider, &mut NoopSolverObserver);
+            observer.on_event(SolverEvent::EnumerationRunFinished { run });
+            if let Err(PubGrubError::NoSolution(reason)) = result {
+                return Err(PubGrubError::NoSolution(reason));
+            }
+        }
         return Err(PubGrubError::NoSolution(
             first_failure.expect("at least one preference solve was attempted"),
         ));

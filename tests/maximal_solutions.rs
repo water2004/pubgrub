@@ -191,6 +191,66 @@ fn minimal_change_preserves_an_installed_version_instead_of_upgrading_it() {
 }
 
 #[test]
+fn unsatisfiable_preferences_report_the_unconstrained_dependency_conflict() {
+    let mut provider = Provider::new();
+    provider.add_dependencies(
+        "root",
+        1u32,
+        [
+            ("eco", Ranges::singleton(1u32)),
+            ("pin", Ranges::singleton(1u32)),
+        ],
+    );
+    provider.add_dependencies("eco", 1u32, [("fapi", Ranges::strictly_higher_than(1u32))]);
+    provider.add_dependencies("pin", 1u32, [("fapi", Ranges::singleton(1u32))]);
+    provider.add_dependencies("fapi", 1u32, []);
+    provider.add_dependencies("fapi", 2u32, []);
+
+    let error = resolve_minimal_change_solutions(
+        &provider,
+        "root",
+        1u32,
+        [
+            PackagePreference::selected("eco", Ranges::singleton(1u32)),
+            PackagePreference::selected("fapi", Ranges::singleton(1u32)),
+            PackagePreference::selected("pin", Ranges::singleton(1u32)),
+        ],
+        ["eco", "fapi", "pin"],
+        ordering(),
+    )
+    .unwrap_err();
+
+    let pubgrub::PubGrubError::NoSolution(tree) = error else {
+        panic!("mutually exclusive dependency pins must be unsatisfiable")
+    };
+    // Every preference branch blames a forced preference clause. The returned
+    // explanation must instead come from the preference-free re-solve, which
+    // reveals the real dependency conflict: both `eco` and `pin` constrain
+    // `fapi`.
+    fn depends_on(
+        tree: &pubgrub::DerivationTree<&'static str, Ranges<u32>, String>,
+        package: &str,
+        dependency: &str,
+    ) -> bool {
+        match tree {
+            pubgrub::DerivationTree::External(pubgrub::External::FromDependencyOf(
+                p,
+                _,
+                d,
+                _,
+            )) => *p == package && *d == dependency,
+            pubgrub::DerivationTree::External(_) => false,
+            pubgrub::DerivationTree::Derived(derived) => {
+                depends_on(&derived.cause1, package, dependency)
+                    || depends_on(&derived.cause2, package, dependency)
+            }
+        }
+    }
+    assert!(depends_on(&tree, "eco", "fapi"));
+    assert!(depends_on(&tree, "pin", "fapi"));
+}
+
+#[test]
 fn incomparable_minimal_change_sets_are_all_returned() {
     let mut provider = Provider::new();
     provider.add_dependencies("root", 1u32, [("choice", Ranges::full())]);
