@@ -136,6 +136,68 @@ fn independent_preference_fronts_are_returned_as_a_product_of_factors() {
 }
 
 #[test]
+fn independent_optional_install_choices_remain_factored_package_states() {
+    let mut provider = Provider::new();
+    provider.add_dependencies(
+        "root",
+        1u32,
+        [
+            ("choice-a", Ranges::full()),
+            ("choice-b", Ranges::full()),
+            ("choice-c", Ranges::full()),
+        ],
+    );
+    for (choice, first, second) in [
+        ("choice-a", "a1", "a2"),
+        ("choice-b", "b1", "b2"),
+        ("choice-c", "c1", "c2"),
+    ] {
+        provider.add_dependencies(choice, 1u32, [(first, Ranges::singleton(1u32))]);
+        provider.add_dependencies(choice, 2u32, [(second, Ranges::singleton(1u32))]);
+        provider.add_dependencies(first, 1u32, []);
+        provider.add_dependencies(second, 1u32, []);
+    }
+
+    let factored = resolve_factored_preference_solutions(
+        &provider,
+        "root",
+        1u32,
+        vec![
+            vec![
+                PackagePreference::absent("a1"),
+                PackagePreference::absent("a2"),
+            ],
+            vec![
+                PackagePreference::absent("b1"),
+                PackagePreference::absent("b2"),
+            ],
+            vec![
+                PackagePreference::absent("c1"),
+                PackagePreference::absent("c2"),
+            ],
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(factored.factors().len(), 3);
+    assert!(
+        factored
+            .factors()
+            .iter()
+            .all(|factor| factor.alternatives().len() == 2)
+    );
+    assert_eq!(factored.complete_assignment_count(), Some(8));
+    assert_eq!(
+        factored
+            .factors()
+            .iter()
+            .map(|factor| factor.alternatives().len())
+            .sum::<usize>(),
+        6
+    );
+}
+
+#[test]
 fn independent_version_fronts_are_returned_without_cartesian_expansion() {
     let mut provider = Provider::new();
     provider.add_dependencies(
