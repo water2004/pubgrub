@@ -164,6 +164,97 @@ pub struct FactoredPreferenceSolutions<P: Package, VS: VersionSet> {
     factors: Vec<PreferenceFactor<P, VS>>,
 }
 
+/// One exact package state selected by a version factor.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PackageDecision<P: Package, V> {
+    package: P,
+    version: Option<V>,
+}
+
+impl<P: Package, V> PackageDecision<P, V> {
+    /// Package whose state is fixed.
+    pub fn package(&self) -> &P {
+        &self.package
+    }
+
+    /// Selected version, or `None` when the package must remain absent.
+    pub fn version(&self) -> Option<&V> {
+        self.version.as_ref()
+    }
+}
+
+/// One Pareto-maximal assignment inside an independent version factor.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct VersionAlternative<P: Package, V> {
+    decisions: Vec<PackageDecision<P, V>>,
+}
+
+impl<P: Package, V> VersionAlternative<P, V> {
+    /// Exact package states which distinguish this alternative.
+    pub fn decisions(&self) -> &[PackageDecision<P, V>] {
+        &self.decisions
+    }
+}
+
+/// Mutually exclusive Pareto-maximal alternatives for one independent version component.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct VersionFactor<P: Package, V> {
+    alternatives: Vec<VersionAlternative<P, V>>,
+}
+
+impl<P: Package, V> VersionFactor<P, V> {
+    /// Pareto-maximal alternatives available for this factor.
+    pub fn alternatives(&self) -> &[VersionAlternative<P, V>] {
+        &self.alternatives
+    }
+}
+
+/// A compact product of independent Pareto-maximal version choices.
+///
+/// Each factor contains the complete local Pareto front for one dependency-graph component. A
+/// complete assignment selects exactly one alternative from every factor, so independent choices
+/// are never expanded into their Cartesian product.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FactoredVersionSolutions<P: Package, V> {
+    factors: Vec<VersionFactor<P, V>>,
+}
+
+impl<P: Package, V: Clone> FactoredVersionSolutions<P, V> {
+    /// Independent factors whose alternatives form the complete solution space.
+    pub fn factors(&self) -> &[VersionFactor<P, V>] {
+        &self.factors
+    }
+
+    /// Number of represented complete assignments, or `None` if the product exceeds `u128`.
+    pub fn complete_assignment_count(&self) -> Option<u128> {
+        self.factors.iter().try_fold(1u128, |count, factor| {
+            count.checked_mul(factor.alternatives.len() as u128)
+        })
+    }
+
+    /// Combine one selected alternative per factor into exact package decisions.
+    pub fn decisions_for(
+        &self,
+        selected_alternatives: &[usize],
+    ) -> Option<Vec<PackageDecision<P, V>>> {
+        if selected_alternatives.len() != self.factors.len() {
+            return None;
+        }
+        let mut decisions = Vec::new();
+        for (factor, selected) in self.factors.iter().zip(selected_alternatives) {
+            decisions.extend(
+                factor
+                    .alternatives
+                    .get(*selected)?
+                    .decisions
+                    .iter()
+                    .cloned(),
+            );
+        }
+        Some(decisions)
+    }
+}
+
 impl<P: Package, VS: VersionSet> FactoredPreferenceSolutions<P, VS> {
     /// Decisions shared by every complete assignment.
     pub fn common(&self) -> &[PreferenceDecision<P, VS>] {
@@ -961,6 +1052,175 @@ where
         &required_terms,
         observer,
     )
+}
+
+/// Enumerate version Pareto fronts independently for caller-provided dependency components.
+///
+/// Every component must contain all projected packages connected through selectable dependencies
+/// or incompatibilities. The selected preference decisions are fixed during every local solve.
+/// Under that partitioning contract, choosing one alternative from each returned factor is exactly
+/// equivalent to choosing one member of the global Pareto front, without constructing the
+/// Cartesian product.
+#[cold]
+pub fn resolve_factored_maximal_solutions_for_preference_decisions<DP, DI, E, R, F>(
+    dependency_provider: &DP,
+    package: DP::P,
+    version: impl Into<DP::V>,
+    decisions: DI,
+    package_components: Vec<Vec<DP::P>>,
+    version_ordering: VersionOrdering<E, R, F>,
+) -> Result<FactoredVersionSolutions<DP::P, DP::V>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    DI: IntoIterator<Item = PreferenceDecision<DP::P, DP::VS>>,
+    E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
+    F: Fn(&DP::V) -> DP::VS,
+{
+    resolve_factored_maximal_solutions_for_preference_decisions_with_observer(
+        dependency_provider,
+        package,
+        version,
+        decisions,
+        package_components,
+        version_ordering,
+        &mut NoopSolverObserver,
+    )
+}
+
+/// Factored version enumeration with observer events for local feasibility work.
+#[cold]
+pub fn resolve_factored_maximal_solutions_for_preference_decisions_with_observer<
+    DP,
+    DI,
+    E,
+    R,
+    F,
+    O,
+>(
+    dependency_provider: &DP,
+    package: DP::P,
+    version: impl Into<DP::V>,
+    decisions: DI,
+    package_components: Vec<Vec<DP::P>>,
+    version_ordering: VersionOrdering<E, R, F>,
+    observer: &mut O,
+) -> Result<FactoredVersionSolutions<DP::P, DP::V>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    DI: IntoIterator<Item = PreferenceDecision<DP::P, DP::VS>>,
+    E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
+    F: Fn(&DP::V) -> DP::VS,
+    O: SolverObserver<DP::P, DP::VS, DP::M>,
+{
+    let root_version = version.into();
+    let required_terms = preference_decisions_to_terms::<DP, DI>(&package, decisions);
+    let borrowed_ordering = BorrowedVersionOrdering {
+        same_version: &version_ordering.same_version,
+        same_precedence: &version_ordering.same_precedence,
+        strictly_higher: &version_ordering.strictly_higher,
+    };
+    let mut factors = Vec::new();
+    for component in package_components {
+        let mut seen = PackageSet::default();
+        let component = component
+            .into_iter()
+            .filter(|candidate| candidate != &package)
+            .filter(|candidate| seen.insert(candidate.clone()))
+            .collect::<Vec<_>>();
+        if component.is_empty() {
+            continue;
+        }
+        let solutions = enumerate_maximal_solutions_with_constraints(
+            dependency_provider,
+            &package,
+            &root_version,
+            &component,
+            &borrowed_ordering,
+            &required_terms,
+            observer,
+        )?;
+        let mut alternatives = solutions
+            .into_iter()
+            .map(|solution| VersionAlternative {
+                decisions: component
+                    .iter()
+                    .cloned()
+                    .map(|component_package| PackageDecision {
+                        version: solution.get(&component_package).cloned(),
+                        package: component_package,
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        alternatives.dedup();
+        factors.push(VersionFactor { alternatives });
+    }
+    Ok(FactoredVersionSolutions { factors })
+}
+
+/// Resolve one complete solution after preference and factored version choices have been fixed.
+#[cold]
+pub fn resolve_for_preference_and_package_decisions_with_observer<DP, DI, PI, E, O>(
+    dependency_provider: &DP,
+    package: DP::P,
+    version: impl Into<DP::V>,
+    preference_decisions: DI,
+    package_decisions: PI,
+    same_version: E,
+    observer: &mut O,
+) -> Result<SelectedDependencies<DP::P, DP::V>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    DI: IntoIterator<Item = PreferenceDecision<DP::P, DP::VS>>,
+    PI: IntoIterator<Item = PackageDecision<DP::P, DP::V>>,
+    E: Fn(&DP::V) -> DP::VS,
+    O: SolverObserver<DP::P, DP::VS, DP::M>,
+{
+    let root_version = version.into();
+    let mut required_terms =
+        preference_decisions_to_terms::<DP, DI>(&package, preference_decisions);
+    required_terms.extend(
+        package_decisions
+            .into_iter()
+            .filter(|decision| decision.package != package)
+            .map(|decision| {
+                let term = decision.version.map_or_else(
+                    || Term::Negative(DP::VS::full()),
+                    |version| Term::Positive(same_version(&version)),
+                );
+                (decision.package, term)
+            }),
+    );
+    let mut solver = SolverState::new(package.clone(), root_version.clone());
+    force_terms(&mut solver, &package, &root_version, &required_terms);
+    let solution = solver.run_until_solution(dependency_provider, observer)?;
+    observer.on_event(SolverEvent::Solution);
+    Ok(solution)
+}
+
+fn preference_decisions_to_terms<DP, DI>(
+    root_package: &DP::P,
+    decisions: DI,
+) -> Vec<(DP::P, Term<DP::VS>)>
+where
+    DP: DependencyProvider,
+    DI: IntoIterator<Item = PreferenceDecision<DP::P, DP::VS>>,
+{
+    decisions
+        .into_iter()
+        .filter(|decision| &decision.preference.package != root_package)
+        .map(|decision| {
+            let preference = decision.preference;
+            let term = if decision.satisfied {
+                preference.preferred
+            } else {
+                preference.preferred.negate()
+            };
+            (preference.package, term)
+        })
+        .collect()
 }
 
 fn usable_preferences<DP, PI>(

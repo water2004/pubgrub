@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 
 use pubgrub::{
     OfflineDependencyProvider, PackagePreference, Ranges, SolverEvent, SolverObserver,
-    VersionOrdering, resolve_factored_preference_solutions, resolve_maximal_solutions,
+    VersionOrdering, resolve_factored_maximal_solutions_for_preference_decisions,
+    resolve_factored_preference_solutions,
+    resolve_for_preference_and_package_decisions_with_observer, resolve_maximal_solutions,
     resolve_maximal_solutions_for_preference_decisions, resolve_maximal_solutions_with_observer,
     resolve_minimal_change_solutions, resolve_minimal_change_solutions_with_observer,
 };
@@ -133,6 +135,73 @@ fn independent_preference_fronts_are_returned_as_a_product_of_factors() {
     assert_eq!((selected_a, selected_b), (1, 1));
 }
 
+#[test]
+fn independent_version_fronts_are_returned_without_cartesian_expansion() {
+    let mut provider = Provider::new();
+    provider.add_dependencies(
+        "root",
+        1u32,
+        [("choice-a", Ranges::full()), ("choice-b", Ranges::full())],
+    );
+    provider.add_dependencies("choice-a", 1u32, [("a1", Ranges::singleton(1u32))]);
+    provider.add_dependencies("choice-a", 2u32, [("a2", Ranges::singleton(1u32))]);
+    provider.add_dependencies("choice-b", 1u32, [("b1", Ranges::singleton(1u32))]);
+    provider.add_dependencies("choice-b", 2u32, [("b2", Ranges::singleton(1u32))]);
+    provider.add_dependencies("a1", 1u32, [("gate-a", Ranges::singleton(1u32))]);
+    provider.add_dependencies("a2", 1u32, [("gate-a", Ranges::singleton(2u32))]);
+    provider.add_dependencies("b1", 1u32, [("gate-b", Ranges::singleton(1u32))]);
+    provider.add_dependencies("b2", 1u32, [("gate-b", Ranges::singleton(2u32))]);
+    for gate in ["gate-a", "gate-b"] {
+        provider.add_dependencies(gate, 1u32, []);
+        provider.add_dependencies(gate, 2u32, []);
+    }
+
+    let factored = resolve_factored_maximal_solutions_for_preference_decisions(
+        &provider,
+        "root",
+        1u32,
+        std::iter::empty(),
+        vec![vec!["a1", "a2"], vec!["b1", "b2"]],
+        ordering(),
+    )
+    .unwrap();
+
+    assert_eq!(factored.factors().len(), 2);
+    assert!(
+        factored
+            .factors()
+            .iter()
+            .all(|factor| factor.alternatives().len() == 2)
+    );
+    assert_eq!(factored.complete_assignment_count(), Some(4));
+
+    let selected = factored.decisions_for(&[0, 1]).unwrap();
+    let solution = resolve_for_preference_and_package_decisions_with_observer(
+        &provider,
+        "root",
+        1u32,
+        std::iter::empty(),
+        selected,
+        |version: &u32| Ranges::singleton(*version),
+        &mut PreferenceProbeCounter::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        ["a1", "a2"]
+            .into_iter()
+            .filter(|package| solution.get(package).is_some())
+            .count(),
+        1
+    );
+    assert_eq!(
+        ["b1", "b2"]
+            .into_iter()
+            .filter(|package| solution.get(package).is_some())
+            .count(),
+        1
+    );
+}
+
 fn enumerate(provider: &Provider) -> BTreeSet<(u32, u32)> {
     projected(
         resolve_maximal_solutions(
@@ -233,12 +302,9 @@ fn unsatisfiable_preferences_report_the_unconstrained_dependency_conflict() {
         dependency: &str,
     ) -> bool {
         match tree {
-            pubgrub::DerivationTree::External(pubgrub::External::FromDependencyOf(
-                p,
-                _,
-                d,
-                _,
-            )) => *p == package && *d == dependency,
+            pubgrub::DerivationTree::External(pubgrub::External::FromDependencyOf(p, _, d, _)) => {
+                *p == package && *d == dependency
+            }
             pubgrub::DerivationTree::External(_) => false,
             pubgrub::DerivationTree::Derived(derived) => {
                 depends_on(&derived.cause1, package, dependency)
