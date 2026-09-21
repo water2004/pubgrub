@@ -32,10 +32,10 @@ struct PreferenceProbeCounter {
 
 impl SolverObserver<&'static str, Ranges<u32>, String> for PreferenceProbeCounter {
     fn on_event(&mut self, event: SolverEvent<'_, &'static str, Ranges<u32>, String>) {
-        if let SolverEvent::PreferenceProbeStarted { package } = event {
-            if *package == "impossible" {
-                self.impossible_started += 1;
-            }
+        if let SolverEvent::PreferenceProbeStarted { package } = event
+            && *package == "impossible"
+        {
+            self.impossible_started += 1;
         }
     }
 
