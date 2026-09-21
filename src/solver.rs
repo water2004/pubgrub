@@ -349,6 +349,7 @@ struct SolverState<DP: DependencyProvider> {
     conflict_tracker: Map<Id<DP::P>, PackageResolutionStatistics>,
     added_dependencies: Map<Id<DP::P>, Set<DP::V>>,
     next: Id<DP::P>,
+    pending_exclusions: Vec<Id<DP::P>>,
 }
 
 impl<DP: DependencyProvider> SolverState<DP> {
@@ -360,6 +361,7 @@ impl<DP: DependencyProvider> SolverState<DP> {
             conflict_tracker: Map::default(),
             added_dependencies: Map::default(),
             next,
+            pending_exclusions: Vec::new(),
         }
     }
 
@@ -370,7 +372,7 @@ impl<DP: DependencyProvider> SolverState<DP> {
         let Some(next) = self.state.add_solution_exclusion(terms) else {
             return false;
         };
-        self.next = next;
+        self.pending_exclusions.push(next);
         true
     }
 
@@ -417,6 +419,11 @@ impl<DP: DependencyProvider> SolverState<DP> {
                     .display(&self.state.package_store)
             );
 
+            if let Some(next) = self.pending_exclusions.pop() {
+                self.next = next;
+                continue;
+            }
+
             let Some((highest_priority_pkg, term_intersection)) = self
                 .state
                 .partial_solution
@@ -428,6 +435,14 @@ impl<DP: DependencyProvider> SolverState<DP> {
                     )
                 })
             else {
+                if let Some(package) = self.state.decide_absent() {
+                    self.next = package;
+                    observer.on_event(SolverEvent::AbsenceDecision {
+                        package: &self.state.package_store[package],
+                        decision_level: self.state.partial_solution.current_decision_level().0,
+                    });
+                    continue;
+                }
                 return Ok(SelectedDependencies(
                     self.state
                         .partial_solution
@@ -861,18 +876,17 @@ where
 
 /// Enumerate independent preference components without expanding their Cartesian product.
 ///
-/// Each inner vector must be one dependency-graph component: no selectable package or
-/// incompatibility may couple preferences in different components. PubGrub verifies every local
-/// alternative against the complete provider graph, but discovering a safe partition is the
-/// caller's responsibility because [`DependencyProvider`] intentionally does not expose its graph.
-/// When that condition holds, the product of the returned factors is exactly the global Pareto
-/// front under set-inclusion preference ordering.
+/// The provider must expose a finite, stable candidate universe. The solver discovers its closure,
+/// propagates fixed domains and partitions residual incompatibilities, including paths through
+/// non-projected packages. Callers supply preferences, not a claimed independence partition.
+/// The product of the returned factors is exactly the global Pareto front under set-inclusion
+/// preference ordering. Every local alternative is checked against the full provider graph.
 #[cold]
 pub fn resolve_factored_preference_solutions<DP>(
     dependency_provider: &DP,
     package: DP::P,
     version: impl Into<DP::V>,
-    preference_components: Vec<Vec<PackagePreference<DP::P, DP::VS>>>,
+    preferences: Vec<PackagePreference<DP::P, DP::VS>>,
 ) -> Result<FactoredPreferenceSolutions<DP::P, DP::VS>, PubGrubError<DP>>
 where
     DP: DependencyProvider,
@@ -881,7 +895,7 @@ where
         dependency_provider,
         package,
         version,
-        preference_components,
+        preferences,
         &mut NoopSolverObserver,
     )
 }
@@ -892,7 +906,7 @@ pub fn resolve_factored_preference_solutions_with_observer<DP, O>(
     dependency_provider: &DP,
     package: DP::P,
     version: impl Into<DP::V>,
-    preference_components: Vec<Vec<PackagePreference<DP::P, DP::VS>>>,
+    preferences: Vec<PackagePreference<DP::P, DP::VS>>,
     observer: &mut O,
 ) -> Result<FactoredPreferenceSolutions<DP::P, DP::VS>, PubGrubError<DP>>
 where
@@ -900,12 +914,8 @@ where
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
     let root_version = version.into();
-    let mut components = preference_components
-        .into_iter()
-        .map(|component| usable_preferences::<DP, _>(&package, component))
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>();
-    if components.is_empty() {
+    let preferences = usable_preferences::<DP, _>(&package, preferences);
+    if preferences.is_empty() {
         enumerate_maximal_preference_satisfactions(
             dependency_provider,
             &package,
@@ -919,9 +929,26 @@ where
         });
     }
 
+    let packages = preferences
+        .iter()
+        .map(|preference| preference.package.clone())
+        .collect::<Vec<_>>();
+    let partition =
+        crate::residual::components(dependency_provider, &package, &root_version, &packages, &[])?;
+    let mut by_package = preferences
+        .into_iter()
+        .map(|preference| (preference.package.clone(), preference))
+        .collect::<Map<_, _>>();
+    let components = partition.into_iter().map(|packages| {
+        packages
+            .into_iter()
+            .filter_map(|package| by_package.remove(&package))
+            .collect::<Vec<_>>()
+    });
+
     let mut common = Vec::new();
     let mut factors = Vec::new();
-    for preferences in components.drain(..) {
+    for preferences in components {
         let satisfaction_front = enumerate_maximal_preference_satisfactions(
             dependency_provider,
             &package,
@@ -1054,20 +1081,21 @@ where
     )
 }
 
-/// Enumerate version Pareto fronts independently for caller-provided dependency components.
+/// Enumerate independent version Pareto fronts without constructing their Cartesian product.
 ///
-/// Every component must contain all projected packages connected through selectable dependencies
-/// or incompatibilities. The selected preference decisions are fixed during every local solve.
-/// Under that partitioning contract, choosing one alternative from each returned factor is exactly
-/// equivalent to choosing one member of the global Pareto front, without constructing the
-/// Cartesian product.
+/// The provider must expose a finite, stable candidate universe. The solver reduces its full
+/// incompatibility graph under the selected preferences, proves frontier-invariant states and
+/// partitions the remaining constraints. Absence is an explicit state, incomparable with presence;
+/// version dominance compares assignments with the same projected package support. Choosing one
+/// alternative from each factor selects a member of the global Pareto front. Constraints that
+/// cannot be separated remain coupled; factoring does not make arbitrary hard graphs cheap.
 #[cold]
 pub fn resolve_factored_maximal_solutions_for_preference_decisions<DP, DI, E, R, F>(
     dependency_provider: &DP,
     package: DP::P,
     version: impl Into<DP::V>,
     decisions: DI,
-    package_components: Vec<Vec<DP::P>>,
+    packages: Vec<DP::P>,
     version_ordering: VersionOrdering<E, R, F>,
 ) -> Result<FactoredVersionSolutions<DP::P, DP::V>, PubGrubError<DP>>
 where
@@ -1082,7 +1110,7 @@ where
         package,
         version,
         decisions,
-        package_components,
+        packages,
         version_ordering,
         &mut NoopSolverObserver,
     )
@@ -1102,7 +1130,7 @@ pub fn resolve_factored_maximal_solutions_for_preference_decisions_with_observer
     package: DP::P,
     version: impl Into<DP::V>,
     decisions: DI,
-    package_components: Vec<Vec<DP::P>>,
+    packages: Vec<DP::P>,
     version_ordering: VersionOrdering<E, R, F>,
     observer: &mut O,
 ) -> Result<FactoredVersionSolutions<DP::P, DP::V>, PubGrubError<DP>>
@@ -1115,13 +1143,42 @@ where
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
     let root_version = version.into();
-    let required_terms = preference_decisions_to_terms::<DP, DI>(&package, decisions);
+    let mut required_terms = preference_decisions_to_terms::<DP, DI>(&package, decisions);
     let borrowed_ordering = BorrowedVersionOrdering {
         same_version: &version_ordering.same_version,
         same_precedence: &version_ordering.same_precedence,
         strictly_higher: &version_ordering.strictly_higher,
     };
     let mut factors = Vec::new();
+    let initial_components = crate::residual::components(
+        dependency_provider,
+        &package,
+        &root_version,
+        &packages,
+        &required_terms,
+    )?;
+    for component in initial_components
+        .iter()
+        .filter(|component| component.len() > 1)
+    {
+        let invariants = pareto_invariants(
+            dependency_provider,
+            &package,
+            &root_version,
+            component,
+            &borrowed_ordering,
+            &required_terms,
+            observer,
+        )?;
+        required_terms.extend(invariants);
+    }
+    let package_components = crate::residual::components(
+        dependency_provider,
+        &package,
+        &root_version,
+        &packages,
+        &required_terms,
+    )?;
     for component in package_components {
         let mut seen = PackageSet::default();
         let component = component
@@ -1388,6 +1445,149 @@ fn collect_forced_packages<P, VS, M>(
     }
 }
 
+/// Prove which projected states are shared by the entire Pareto front. Each query excludes one
+/// reference state; failed candidates eliminate a whole dominated region, never a single product
+/// assignment. Witnesses are reused across packages. Only proved invariants may disconnect edges.
+#[allow(clippy::type_complexity)]
+fn pareto_invariants<DP, E, R, F, O>(
+    provider: &DP,
+    root: &DP::P,
+    version: &DP::V,
+    packages: &[DP::P],
+    ordering: &BorrowedVersionOrdering<'_, E, R, F>,
+    required: &[(DP::P, Term<DP::VS>)],
+    observer: &mut O,
+) -> Result<Vec<(DP::P, Term<DP::VS>)>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
+    F: Fn(&DP::V) -> DP::VS,
+    O: SolverObserver<DP::P, DP::VS, DP::M>,
+{
+    let context = DominatingContext {
+        root_package: root,
+        root_version: version,
+        maximized_packages: packages,
+        ordering,
+        required_terms: required,
+    };
+    let mut solver = SolverState::new(root.clone(), version.clone());
+    force_terms(&mut solver, root, version, required);
+    observer.on_event(SolverEvent::EnumerationRunStarted { run: 1 });
+    let result = solver.run_until_solution(provider, observer);
+    observer.on_event(SolverEvent::EnumerationRunFinished { run: 1 });
+    let solution = result?;
+    let reference = maximize_solution(provider, solution, &context, observer)?;
+    let mut witnesses = Vec::new();
+    let mut invariants = Vec::new();
+    for package in packages {
+        let state = reference.get(package).map_or_else(
+            || Term::Negative(DP::VS::full()),
+            |version| Term::Positive((ordering.same_version)(version)),
+        );
+        let agrees = |solution: &SelectedDependencies<DP::P, DP::V>| {
+            solution
+                .get(package)
+                .map_or(!state.is_positive(), |version| state.contains(version))
+        };
+        if witnesses.iter().any(|witness| !agrees(witness)) {
+            continue;
+        }
+        let mut probe = SolverState::new(root.clone(), version.clone());
+        force_terms(&mut probe, root, version, required);
+        force_terms(&mut probe, root, version, &invariants);
+        force_terms(
+            &mut probe,
+            root,
+            version,
+            &[(package.clone(), state.negate())],
+        );
+        exclude_dominated(&mut probe, &reference, packages, ordering);
+        for witness in &witnesses {
+            exclude_dominated(&mut probe, witness, packages, ordering);
+        }
+        let mut run = 0;
+        loop {
+            run += 1;
+            observer.on_event(SolverEvent::EnumerationRunStarted { run });
+            let result = probe.run_until_solution(provider, observer);
+            observer.on_event(SolverEvent::EnumerationRunFinished { run });
+            let candidate = match result {
+                Ok(candidate) => candidate,
+                Err(PubGrubError::NoSolution(_)) => {
+                    invariants.push((package.clone(), state));
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            let maximal = maximize_solution(provider, candidate, &context, observer)?;
+            let alternative = !agrees(&maximal);
+            exclude_dominated(&mut probe, &maximal, packages, ordering);
+            witnesses.push(maximal);
+            if alternative {
+                break;
+            }
+        }
+    }
+    Ok(invariants)
+}
+
+fn maximize_solution<DP, E, R, F, O>(
+    provider: &DP,
+    mut solution: SelectedDependencies<DP::P, DP::V>,
+    context: &DominatingContext<'_, DP, E, R, F>,
+    observer: &mut O,
+) -> Result<SelectedDependencies<DP::P, DP::V>, PubGrubError<DP>>
+where
+    DP: DependencyProvider,
+    E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
+    F: Fn(&DP::V) -> DP::VS,
+    O: SolverObserver<DP::P, DP::VS, DP::M>,
+{
+    loop {
+        validate_version_ordering(&solution, context.maximized_packages, context.ordering)?;
+        match find_dominating_solution(provider, &solution, context, observer)? {
+            Some(dominating) => solution = dominating,
+            None => return Ok(solution),
+        }
+    }
+}
+
+fn exclude_dominated<DP, E, R, F>(
+    solver: &mut SolverState<DP>,
+    retained: &SelectedDependencies<DP::P, DP::V>,
+    packages: &[DP::P],
+    ordering: &BorrowedVersionOrdering<'_, E, R, F>,
+) where
+    DP: DependencyProvider,
+    E: Fn(&DP::V) -> DP::VS,
+    R: Fn(&DP::V) -> DP::VS,
+    F: Fn(&DP::V) -> DP::VS,
+{
+    for lower_package in packages {
+        let Some(lower_version) = retained.get(lower_package) else {
+            continue;
+        };
+        let lower = (ordering.same_precedence)(lower_version)
+            .union(&(ordering.strictly_higher)(lower_version))
+            .complement();
+        let dominated = packages.iter().map(|selected| {
+            let term = if selected == lower_package {
+                Term::Positive(lower.clone())
+            } else {
+                retained.get(selected).map_or_else(
+                    || Term::Negative(DP::VS::full()),
+                    |version| Term::Positive((ordering.strictly_higher)(version).complement()),
+                )
+            };
+            (selected.clone(), term)
+        });
+        solver.add_solution_exclusion(dominated);
+    }
+}
+
 fn enumerate_maximal_solutions_with_constraints<DP, E, R, F, O>(
     dependency_provider: &DP,
     root_package: &DP::P,
@@ -1414,7 +1614,7 @@ where
         observer.on_event(SolverEvent::EnumerationRunStarted { run });
         let run_result = solver.run_until_solution(dependency_provider, observer);
         observer.on_event(SolverEvent::EnumerationRunFinished { run });
-        let mut solution = match run_result {
+        let solution = match run_result {
             Ok(solution) => solution,
             Err(PubGrubError::NoSolution(reason)) if solutions.is_empty() => {
                 return Err(PubGrubError::NoSolution(reason));
@@ -1427,31 +1627,25 @@ where
             return Ok(vec![solution]);
         }
 
-        loop {
-            validate_version_ordering(&solution, maximized_packages, version_ordering)?;
-            let context = DominatingContext {
-                root_package,
-                root_version,
-                maximized_packages,
-                ordering: version_ordering,
-                required_terms,
-            };
-            let Some(dominating) =
-                find_dominating_solution(dependency_provider, &solution, &context, observer)?
-            else {
-                break;
-            };
-            solution = dominating;
-        }
+        let context = DominatingContext {
+            root_package,
+            root_version,
+            maximized_packages,
+            ordering: version_ordering,
+            required_terms,
+        };
+        let solution = maximize_solution(dependency_provider, solution, &context, observer)?;
 
         observer.on_event(SolverEvent::Solution);
-        let exact_exclusion = solution
+        let exact_exclusion = maximized_packages
             .iter()
-            .filter(|(selected, _)| maximized_packages.contains(selected))
-            .map(|(selected, version)| {
+            .map(|selected| {
                 (
                     selected.clone(),
-                    Term::Positive((version_ordering.same_version)(version)),
+                    solution.get(selected).map_or_else(
+                        || Term::Negative(DP::VS::full()),
+                        |version| Term::Positive((version_ordering.same_version)(version)),
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -1461,31 +1655,7 @@ where
             return Ok(solutions);
         }
         let retained = solutions.last().expect("a solution was just retained");
-        for (lower_package, lower_version) in retained
-            .iter()
-            .filter(|(selected, _)| maximized_packages.contains(selected))
-        {
-            let not_lower = (version_ordering.same_precedence)(lower_version)
-                .union(&(version_ordering.strictly_higher)(lower_version));
-            let lower = not_lower.complement();
-            let dominated = retained
-                .iter()
-                .filter(|(selected, _)| maximized_packages.contains(selected))
-                .map(|(selected, version)| {
-                    if selected == lower_package {
-                        (selected.clone(), Term::Positive(lower.clone()))
-                    } else {
-                        (
-                            selected.clone(),
-                            Term::Negative((version_ordering.strictly_higher)(version)),
-                        )
-                    }
-                })
-                .collect::<Vec<_>>();
-            if !dominated.is_empty() {
-                solver.add_solution_exclusion(dominated);
-            }
-        }
+        exclude_dominated(&mut solver, retained, maximized_packages, version_ordering);
     }
 }
 
@@ -1601,10 +1771,14 @@ where
             )
         };
 
-        for (selected, version) in solution.iter() {
-            if selected == context.root_package || !context.maximized_packages.contains(selected) {
+        for selected in context.maximized_packages {
+            let Some(version) = solution.get(selected) else {
+                probe.add_solution_exclusion([
+                    root_term(),
+                    (selected.clone(), Term::Positive(DP::VS::full())),
+                ]);
                 continue;
-            }
+            };
             let required = if selected == candidate {
                 (context.ordering.strictly_higher)(version)
             } else {

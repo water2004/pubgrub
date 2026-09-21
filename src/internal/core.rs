@@ -135,6 +135,20 @@ impl<DP: DependencyProvider> State<DP> {
         Some(next)
     }
 
+    /// Complete unresolved package states with explicit absence decisions. Custom disjunctions
+    /// and solution exclusions may require at least one of several otherwise optional packages;
+    /// treating all undecided packages as absent without propagation would accept invalid models.
+    pub(crate) fn decide_absent(&mut self) -> Option<Id<DP::P>> {
+        let absent = Term::Negative(DP::VS::full());
+        let package = self.incompatibilities.keys().copied().find(|package| {
+            self.partial_solution
+                .term_intersection_for_package(*package)
+                .is_none_or(|term| !term.is_positive() && term != &absent)
+        })?;
+        self.partial_solution.add_absence_decision(package);
+        Some(package)
+    }
+
     /// Add a single custom incompatibility that requires that the base package and the proxy
     /// package share the same version range.
     ///

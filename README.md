@@ -104,6 +104,12 @@ strictly higher. The requested package list is also the solution projection;
 solver-internal or otherwise unlisted packages may change and do not create a
 distinct result.
 
+Absence is a first-class, backtrackable package state. Presence and absence are
+incomparable in the version order: dominance compares solutions with the same
+projected package support. Thus optional installation choices are retained, but
+no result may violate a dependency disjunction by silently treating all
+undecided alternatives as absent.
+
 The enumerator grows each candidate along non-decreasing projected coordinates
 until it reaches a Pareto point. It then excludes the whole region dominated by
 that point. Independent lower versions therefore do not create a Cartesian
@@ -126,6 +132,19 @@ disjointness between these sets before adding enumeration clauses.
 
 The Pareto or co-Pareto front can still be large;
 `DependencyProvider::should_cancel` is checked throughout enumeration.
+
+For factored results, use `resolve_factored_preference_solutions` followed by
+`resolve_factored_maximal_solutions_for_preference_decisions`. These APIs require
+a finite, stable provider universe and accept flat projections, not
+caller-guessed partitions. The solver discovers the complete candidate closure,
+propagates fixed domains and partitions residual incompatibility hyperedges,
+including non-projected intermediate packages. Before enumerating version
+factors it also proves frontier-invariant states with dominance-pruned queries,
+then reduces the graph again. Already satisfied shared dependencies no longer
+join independent optional consumers. Unproved dependencies remain coupled.
+The representation stores local alternatives rather than their Cartesian
+product; `resolve_for_preference_and_package_decisions_with_observer` verifies
+the final choices together in the original graph.
 
 ## Provider-defined incompatibilities
 

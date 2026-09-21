@@ -11,6 +11,63 @@ use pubgrub::{
 
 type Provider = OfflineDependencyProvider<&'static str, Ranges<u32>>;
 
+#[test]
+fn frontier_invariants_split_optional_consumers_before_product_enumeration() {
+    let mut provider = Provider::new();
+    provider.add_dependencies("root", 1u32, [("shared", Ranges::full())]);
+    provider.add_dependencies("shared", 1u32, []);
+    provider.add_dependencies("shared", 2u32, []);
+    let optional = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"];
+    for package in optional {
+        for version in 1..=2u32 {
+            provider.add_dependencies(package, version, [("shared", Ranges::singleton(2u32))]);
+        }
+    }
+    let packages = std::iter::once("shared").chain(optional).collect();
+    let factored = resolve_factored_maximal_solutions_for_preference_decisions(
+        &provider,
+        "root",
+        1u32,
+        std::iter::empty(),
+        packages,
+        ordering(),
+    )
+    .unwrap();
+    // shared=2 is not forced by feasibility. It must be proved invariant on the Pareto front
+    // before the optional consumers can be separated safely.
+    assert_eq!(factored.complete_assignment_count(), Some(4096));
+    assert_eq!(factored.factors().len(), 13);
+    assert_eq!(
+        factored
+            .factors()
+            .iter()
+            .map(|factor| factor.alternatives().len())
+            .sum::<usize>(),
+        25
+    );
+    for mask in [0usize, 1, 1365, 2730, 4095] {
+        let choices = (0..12)
+            .map(|bit| (mask >> bit) & 1)
+            .chain([0])
+            .collect::<Vec<_>>();
+        let decisions = factored.decisions_for(&choices).unwrap();
+        let solution = resolve_for_preference_and_package_decisions_with_observer(
+            &provider,
+            "root",
+            1u32,
+            std::iter::empty(),
+            decisions,
+            |version: &u32| Ranges::singleton(*version),
+            &mut PreferenceProbeCounter::default(),
+        )
+        .unwrap();
+        assert_eq!(solution.get(&"shared"), Some(&2));
+        for package in optional {
+            assert!(solution.get(&package).is_none_or(|version| *version == 2));
+        }
+    }
+}
+
 fn projected(
     solutions: impl IntoIterator<Item = pubgrub::SelectedDependencies<&'static str, u32>>,
 ) -> BTreeSet<(u32, u32)> {
@@ -99,7 +156,10 @@ fn independent_preference_fronts_are_returned_as_a_product_of_factors() {
                 PackagePreference::selected("b1", Ranges::singleton(1u32)),
                 PackagePreference::selected("b2", Ranges::singleton(1u32)),
             ],
-        ],
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
     )
     .unwrap();
 
@@ -175,7 +235,10 @@ fn independent_optional_install_choices_remain_factored_package_states() {
                 PackagePreference::absent("c1"),
                 PackagePreference::absent("c2"),
             ],
-        ],
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
     )
     .unwrap();
 
@@ -223,7 +286,7 @@ fn independent_version_fronts_are_returned_without_cartesian_expansion() {
         "root",
         1u32,
         std::iter::empty(),
-        vec![vec!["a1", "a2"], vec!["b1", "b2"]],
+        vec!["a1", "a2", "b1", "b2"],
         ordering(),
     )
     .unwrap();
@@ -279,6 +342,59 @@ fn enumerate(provider: &Provider) -> BTreeSet<(u32, u32)> {
         )
         .unwrap(),
     )
+}
+
+#[test]
+fn optional_presence_is_a_state_and_shared_satisfied_dependencies_do_not_join_factors() {
+    let mut provider = Provider::new();
+    provider.add_dependencies("root", 1u32, [("shared", Ranges::full())]);
+    provider.add_dependencies("shared", 1u32, []);
+    for package in ["a", "b", "c"] {
+        provider.add_dependencies(package, 1u32, [("shared", Ranges::full())]);
+        provider.add_dependencies(package, 2u32, [("shared", Ranges::full())]);
+    }
+    let factored = resolve_factored_maximal_solutions_for_preference_decisions(
+        &provider,
+        "root",
+        1u32,
+        [],
+        vec!["a", "b", "c"],
+        ordering(),
+    )
+    .unwrap();
+    assert_eq!(factored.factors().len(), 3);
+    assert_eq!(factored.complete_assignment_count(), Some(8));
+    for factor in factored.factors() {
+        let states = factor
+            .alternatives()
+            .iter()
+            .map(|alternative| *alternative.decisions()[0].version().unwrap_or(&0))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(states, BTreeSet::from([0, 2]));
+    }
+    let eager =
+        resolve_maximal_solutions(&provider, "root", 1u32, ["a", "b", "c"], ordering()).unwrap();
+    assert_eq!(eager.len(), 8);
+    for mask in 0..8 {
+        let decisions = factored
+            .decisions_for(&(0..3).map(|bit| (mask >> bit) & 1).collect::<Vec<_>>())
+            .unwrap();
+        let solution = resolve_for_preference_and_package_decisions_with_observer(
+            &provider,
+            "root",
+            1u32,
+            [],
+            decisions,
+            |version: &u32| Ranges::singleton(*version),
+            &mut PreferenceProbeCounter::default(),
+        )
+        .unwrap();
+        assert!(eager.iter().any(|candidate| {
+            ["a", "b", "c"]
+                .iter()
+                .all(|p| candidate.get(p) == solution.get(p))
+        }));
+    }
 }
 
 type NumericOrdering =
@@ -807,6 +923,45 @@ fn pareto_enumeration_matches_every_three_by_three_feasibility_relation() {
             enumerate(&provider),
             expected,
             "wrong Pareto front for feasible relation {feasible:?}"
+        );
+        let factored = resolve_factored_maximal_solutions_for_preference_decisions(
+            &provider,
+            "root",
+            1u32,
+            std::iter::empty(),
+            vec!["a", "b"],
+            ordering(),
+        )
+        .unwrap();
+        let mut selections = vec![Vec::new()];
+        for factor in factored.factors() {
+            selections = selections
+                .into_iter()
+                .flat_map(|prefix| {
+                    (0..factor.alternatives().len()).map(move |index| {
+                        let mut selection = prefix.clone();
+                        selection.push(index);
+                        selection
+                    })
+                })
+                .collect();
+        }
+        let actual = selections.iter().map(|selection| {
+            resolve_for_preference_and_package_decisions_with_observer(
+                &provider,
+                "root",
+                1u32,
+                std::iter::empty(),
+                factored.decisions_for(selection).unwrap(),
+                |version: &u32| Ranges::singleton(*version),
+                &mut PreferenceProbeCounter::default(),
+            )
+            .expect("every factored combination must be feasible")
+        });
+        assert_eq!(
+            projected(actual),
+            expected,
+            "wrong factored front for {feasible:?}"
         );
     }
 }

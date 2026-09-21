@@ -255,3 +255,80 @@ fn provider_clause_negative_terms_support_conditional_requirements() {
 
     assert_eq!(resolution.get(&"b"), Some(&1));
 }
+
+#[test]
+fn disjunctive_dependencies_cannot_succeed_with_every_alternative_absent() {
+    let mut provider = ClauseProvider::default();
+    provider.packages.add_dependencies("root", 1_u32, []);
+    provider.packages.add_dependencies("a", 1_u32, []);
+    provider.packages.add_dependencies("b", 1_u32, []);
+    provider.clauses.insert(
+        ("root", 1),
+        vec![IncompatibilityConstraint {
+            terms: vec![
+                IncompatibilityConstraintTerm::Negative("a", Ranges::full()),
+                IncompatibilityConstraintTerm::Negative("b", Ranges::full()),
+            ],
+            reason: "root requires a or b".to_string(),
+        }],
+    );
+    let solution = resolve(&provider, "root", 1_u32).unwrap();
+    assert!(solution.get(&"a").is_some() || solution.get(&"b").is_some());
+    provider
+        .packages
+        .add_dependencies("a", 1_u32, [("missing", Ranges::full())]);
+    provider
+        .packages
+        .add_dependencies("b", 1_u32, [("missing", Ranges::full())]);
+    assert!(matches!(
+        resolve(&provider, "root", 1_u32),
+        Err(PubGrubError::NoSolution(_))
+    ));
+}
+
+#[test]
+fn residual_factoring_preserves_three_way_conflicts() {
+    let mut provider = ClauseProvider::default();
+    provider.packages.add_dependencies("root", 1_u32, []);
+    for package in ["a", "b", "c"] {
+        provider.packages.add_dependencies(package, 1_u32, []);
+    }
+    provider.clauses.insert(
+        ("root", 1),
+        vec![IncompatibilityConstraint {
+            terms: ["a", "b", "c"]
+                .into_iter()
+                .map(|p| IncompatibilityConstraintTerm::Positive(p, Ranges::full()))
+                .collect(),
+            reason: "all three packages cannot coexist".to_string(),
+        }],
+    );
+    let factored = pubgrub::resolve_factored_maximal_solutions_for_preference_decisions(
+        &provider,
+        "root",
+        1_u32,
+        [],
+        vec!["a", "b", "c"],
+        pubgrub::VersionOrdering::new(
+            |v: &u32| Ranges::singleton(*v),
+            |v: &u32| Ranges::singleton(*v),
+            |v: &u32| Ranges::strictly_higher_than(*v),
+        ),
+    )
+    .unwrap();
+    assert_eq!(factored.factors().len(), 1);
+    assert_eq!(factored.complete_assignment_count(), Some(7));
+    assert!(
+        factored.factors()[0]
+            .alternatives()
+            .iter()
+            .all(|alternative| {
+                alternative
+                    .decisions()
+                    .iter()
+                    .filter(|decision| decision.version().is_some())
+                    .count()
+                    < 3
+            })
+    );
+}

@@ -77,9 +77,9 @@ struct PackageAssignments<P: Package, VS: VersionSet, M: Eq + Clone + Debug + Di
     /// All constraints on the package version from previous decisions, accumulated by decision
     /// level.
     dated_derivations: SmallVec<DatedDerivation<P, VS, M>>,
-    /// Smallest [`DecisionLevel`] in `dated_derivations`.
+    /// Earliest assignment level, including a standalone absence decision with no derivations.
     smallest_decision_level: DecisionLevel,
-    /// Highest [`DecisionLevel`] in `dated_derivations`.
+    /// Latest assignment level, including the decision if present.
     highest_decision_level: DecisionLevel,
 }
 
@@ -129,8 +129,8 @@ enum AssignmentsIntersection<VS: VersionSet> {
     /// A decision on package for version has been made at the given level.
     Decision {
         decision_level: u32,
-        version: VS::V,
-        /// The version, but as positive singleton term.
+        version: Option<VS::V>,
+        /// Positive singleton for a selected version, or negative full set for absence.
         term: Term<VS>,
     },
     Derivations(Term<VS>),
@@ -143,9 +143,10 @@ impl<VS: VersionSet> Display for AssignmentsIntersection<VS> {
                 decision_level,
                 version,
                 term: _,
-            } => {
-                write!(f, "Decision: level {decision_level}, v = {version}")
-            }
+            } => match version {
+                Some(version) => write!(f, "Decision: level {decision_level}, v = {version}"),
+                None => write!(f, "Decision: level {decision_level}, absent"),
+            },
             Self::Derivations(term) => write!(f, "Derivations term: {term}"),
         }
     }
@@ -203,6 +204,24 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
 
     /// Add a decision.
     pub(crate) fn add_decision(&mut self, package: Id<DP::P>, version: DP::V) {
+        self.add_state_decision(package, Some(version));
+    }
+
+    pub(crate) fn add_absence_decision(&mut self, package: Id<DP::P>) {
+        // An optional package can have no previous assignment. Its unconstrained starting
+        // domain is not a derivation and must not fabricate a dependency reason.
+        self.package_assignments
+            .entry(package)
+            .or_insert_with(|| PackageAssignments {
+                assignments_intersection: AssignmentsIntersection::Derivations(Term::any()),
+                dated_derivations: SmallVec::Empty,
+                smallest_decision_level: self.current_decision_level.increment(),
+                highest_decision_level: self.current_decision_level.increment(),
+            });
+        self.add_state_decision(package, None);
+    }
+
+    fn add_state_decision(&mut self, package: Id<DP::P>, version: Option<DP::V>) {
         // Check that add_decision is never used in the wrong context.
         if cfg!(debug_assertions) {
             match self.package_assignments.get_mut(&package) {
@@ -215,8 +234,10 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
                     // Cannot be called if the versions is not contained in the terms' intersection.
                     AssignmentsIntersection::Derivations(term) => {
                         debug_assert!(
-                            term.contains(&version),
-                            "{package:?}: {version} was expected to be contained in {term}",
+                            version
+                                .as_ref()
+                                .map_or(!term.is_positive(), |version| term.contains(version)),
+                            "{package:?}: {version:?} was expected to be contained in {term}",
                         )
                     }
                 },
@@ -232,7 +253,7 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
         pa.assignments_intersection = AssignmentsIntersection::Decision {
             decision_level: self.next_global_index,
             version: version.clone(),
-            term: Term::exact(version),
+            term: version.map_or_else(|| Term::Negative(DP::VS::full()), Term::exact),
         };
         // Maintain that the beginning of the `package_assignments` Have all decisions in sorted order.
         if new_idx != old_idx {
@@ -324,12 +345,12 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
         self.package_assignments
             .iter()
             .take(self.current_decision_level.0 as usize)
-            .map(|(&p, pa)| match &pa.assignments_intersection {
+            .filter_map(|(&p, pa)| match &pa.assignments_intersection {
                 AssignmentsIntersection::Decision {
                     decision_level: _,
                     version: v,
                     term: _,
-                } => (p, v.clone()),
+                } => v.clone().map(|v| (p, v)),
                 AssignmentsIntersection::Derivations(_) => {
                     // The invariant on the order in `self.package_assignments` was broken.
                     let mut context = String::new();
@@ -556,19 +577,22 @@ impl<DP: DependencyProvider> PartialSolution<DP> {
             .get(satisfier_package)
             .expect("satisfier package not in incompat");
 
-        satisfied_map.insert(
-            satisfier_package,
-            satisfier_pa.satisfier(
+        let previous_term = accum_term.intersection(&incompat_term.negate());
+        if previous_term == Term::empty() && satisfier_pa.dated_derivations.is_empty() {
+            // A standalone absence decision needs no earlier assignment to the same package.
+            satisfied_map.remove(&satisfier_package);
+        } else {
+            satisfied_map.insert(
                 satisfier_package,
-                &accum_term.intersection(&incompat_term.negate()),
-            ),
-        );
+                satisfier_pa.satisfier(satisfier_package, &previous_term),
+            );
+        }
 
         // Finally, let's identify the decision level of that previous satisfier.
-        let (_, &(_, _, decision_level)) = satisfied_map
+        let decision_level = satisfied_map
             .iter()
             .max_by_key(|(_p, (_, global_index, _))| global_index)
-            .unwrap();
+            .map_or(DecisionLevel(1), |(_, (_, _, level))| *level);
         decision_level.max(DecisionLevel(1))
     }
 

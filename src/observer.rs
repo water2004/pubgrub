@@ -41,6 +41,13 @@ where
     VS: VersionSet,
     M: Eq + Clone + Debug + Display,
 {
+    /// The solver committed an absent package state, subject to ordinary propagation/backtracking.
+    AbsenceDecision {
+        /// Package omitted by this decision.
+        package: &'a P,
+        /// Decision level assigned to the absence.
+        decision_level: u32,
+    },
     /// The solver selected a package for its next version decision.
     PackageChoice {
         /// Package selected for the next decision.
