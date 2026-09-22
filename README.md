@@ -115,11 +115,20 @@ until it reaches a Pareto point. It then excludes the whole region dominated by
 that point. Independent lower versions therefore do not create a Cartesian
 product of locally maximality checks.
 
+Each ascent asks one joint feasibility question: preserve support, do not decrease
+any projected coordinate, and strictly improve at least one. The disjunction of
+strict improvements is a native incompatibility clause, not a loop of one fresh
+solver per package. Bounds tighten monotonically in a single ascent, allowing its
+dependency cache and learned incompatibilities to be reused. The preceding
+assignment is a branching preference only; it does not constrain the front.
+
 Use `resolve_maximal_solutions_with_observer` when the application also needs
 the real derivation path for each result. It continues one enumeration session
 and emits `SolverEvent::Solution` once per retained point. Feasibility probes
 have typed start/finish boundaries and outcomes. A successful probe becomes the
 new retained path; a failed probe can be rolled back by a stateful observer.
+`MaximalityProbeStarted::continuation` tells observers when to retain the preceding
+probe's decisions rather than initialize a fresh path.
 Enumeration clauses have their own `ExcludedSolution` reason, so they cannot
 be mistaken for provider dependency metadata.
 
@@ -139,12 +148,25 @@ a finite, stable provider universe and accept flat projections, not
 caller-guessed partitions. The solver discovers the complete candidate closure,
 propagates fixed domains and partitions residual incompatibility hyperedges,
 including non-projected intermediate packages. Before enumerating version
-factors it also proves frontier-invariant states with dominance-pruned queries,
-then reduces the graph again. Already satisfied shared dependencies no longer
+factors it proves useful frontier-invariant separators with dominance-pruned queries,
+prioritizing states whose fixation splits the most residual components. A skipped
+proof is only a cost heuristic: that state remains unconstrained. Only proved
+invariants can remove an edge. Already satisfied shared dependencies no longer
 join independent optional consumers. Unproved dependencies remain coupled.
 The representation stores local alternatives rather than their Cartesian
 product; `resolve_for_preference_and_package_decisions_with_observer` verifies
 the final choices together in the original graph.
+
+The finite provider model is compiled once and reused for decomposition and
+substitution proofs. When a witness is strictly improved, the solver follows the
+clauses needed for that improvement (including non-projected internal packages).
+Unchanged projected boundary terms guard the replacement; changed coordinates
+range over all dominated versions, with one strictly lower coordinate. Every
+feasible assignment in this region admits the same strict improvement. Blocking
+that region is therefore sound without enumerating unrelated artifact or optional
+presence combinations. It never blocks an equal-rank-only alternative. Tests
+exhaustively compare small feasible relations and independently check these
+regions against their Pareto points, including absence and hidden variables.
 
 ## Provider-defined incompatibilities
 

@@ -17,13 +17,12 @@ use std::fmt::{Debug, Display};
 
 use crate::{DerivationTree, Package, Term, VersionSet};
 
-/// Outcome of a projected-package feasibility probe used to grow a Pareto solution.
+/// Outcome of a feasibility probe used to grow a Pareto solution.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MaximalityProbeResult {
-    /// The probe found a solution that strictly improves the selected package without lowering
-    /// any other selected projected package.
+    /// The probe found a strict improvement without lowering another projected coordinate.
     Improved,
-    /// No such dominating solution exists for the selected package.
+    /// No such dominating solution exists.
     NoImprovement,
     /// The probe stopped because the dependency provider returned an error.
     Error,
@@ -118,19 +117,28 @@ where
         /// One-based index matching [`EnumerationRunStarted`](Self::EnumerationRunStarted).
         run: usize,
     },
-    /// A feasibility probe is starting for one projected package.
+    /// Search for a Pareto witness differing from a reference package state, before factorization.
+    InvariantProbeStarted {
+        /// Projected package being checked.
+        package: &'a P,
+    },
+    /// The invariant query either proved the reference state or found a counterexample.
+    InvariantProbeFinished {
+        /// Projected package checked.
+        package: &'a P,
+    },
+    /// A feasibility probe is starting for any dominating strict improvement.
     ///
     /// Probe-internal events follow this boundary. Observers that retain path state should
     /// checkpoint it here, then either commit or roll it back according to the matching
     /// [`MaximalityProbeFinished`](Self::MaximalityProbeFinished) result.
     MaximalityProbeStarted {
-        /// Projected package being checked for a dominating strict upgrade.
-        package: &'a P,
+        /// Reuses the preceding successful probe's solver state. Observers should keep that
+        /// state's decisions and derivations instead of clearing them for a fresh solve.
+        continuation: bool,
     },
-    /// A projected-package maximality probe finished.
+    /// A joint maximality probe finished.
     MaximalityProbeFinished {
-        /// Projected package checked by the completed probe.
-        package: &'a P,
         /// Whether the probe found a dominating solution.
         result: MaximalityProbeResult,
     },

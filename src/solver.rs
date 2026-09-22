@@ -384,6 +384,18 @@ impl<DP: DependencyProvider> SolverState<DP> {
     where
         O: SolverObserver<DP::P, DP::VS, DP::M>,
     {
+        self.run_until_solution_preferring(dependency_provider, observer, None)
+    }
+
+    fn run_until_solution_preferring<O>(
+        &mut self,
+        dependency_provider: &DP,
+        observer: &mut O,
+        preferred: Option<&SelectedDependencies<DP::P, DP::V>>,
+    ) -> Result<SelectedDependencies<DP::P, DP::V>, PubGrubError<DP>>
+    where
+        O: SolverObserver<DP::P, DP::VS, DP::M>,
+    {
         loop {
             dependency_provider
                 .should_cancel()
@@ -457,12 +469,18 @@ impl<DP: DependencyProvider> SolverState<DP> {
                 allowed: term_intersection,
             });
 
-            let decision = dependency_provider
-                .choose_version(&self.state.package_store[self.next], term_intersection)
-                .map_err(|source| PubGrubError::ErrorChoosingVersion {
-                    package: self.state.package_store[self.next].clone(),
-                    source,
-                })?;
+            let preferred = preferred
+                .and_then(|versions| versions.get(&self.state.package_store[self.next]))
+                .filter(|version| term_intersection.contains(version));
+            let decision = match preferred {
+                Some(version) => Some(version.clone()),
+                None => dependency_provider
+                    .choose_version(&self.state.package_store[self.next], term_intersection)
+                    .map_err(|source| PubGrubError::ErrorChoosingVersion {
+                        package: self.state.package_store[self.next].clone(),
+                        source,
+                    })?,
+            };
 
             info!(
                 "DP chose: {:?} = '{}' @ {:?}",
@@ -1150,7 +1168,8 @@ where
         strictly_higher: &version_ordering.strictly_higher,
     };
     let mut factors = Vec::new();
-    let initial_components = crate::residual::components(
+    let model = crate::residual::load(dependency_provider, &package, &packages, &required_terms)?;
+    let initial_components = model.partition(
         dependency_provider,
         &package,
         &root_version,
@@ -1158,28 +1177,28 @@ where
         &required_terms,
     )?;
     for component in initial_components
+        .variable
         .iter()
         .filter(|component| component.len() > 1)
     {
-        let invariants = pareto_invariants(
-            dependency_provider,
-            &package,
-            &root_version,
-            component,
-            &borrowed_ordering,
-            &required_terms,
-            observer,
-        )?;
+        let context = DominatingContext {
+            root_package: &package,
+            root_version: &root_version,
+            maximized_packages: component,
+            ordering: &borrowed_ordering,
+            required_terms: &required_terms,
+        };
+        let invariants = pareto_invariants(dependency_provider, &context, &model, observer)?;
         required_terms.extend(invariants);
     }
-    let package_components = crate::residual::components(
+    let package_components = model.partition(
         dependency_provider,
         &package,
         &root_version,
         &packages,
         &required_terms,
     )?;
-    for component in package_components {
+    for component in package_components.into_components() {
         let mut seen = PackageSet::default();
         let component = component
             .into_iter()
@@ -1451,11 +1470,8 @@ fn collect_forced_packages<P, VS, M>(
 #[allow(clippy::type_complexity)]
 fn pareto_invariants<DP, E, R, F, O>(
     provider: &DP,
-    root: &DP::P,
-    version: &DP::V,
-    packages: &[DP::P],
-    ordering: &BorrowedVersionOrdering<'_, E, R, F>,
-    required: &[(DP::P, Term<DP::VS>)],
+    context: &DominatingContext<'_, DP, E, R, F>,
+    model: &crate::residual::ConstraintModel<DP::P, DP::VS>,
     observer: &mut O,
 ) -> Result<Vec<(DP::P, Term<DP::VS>)>, PubGrubError<DP>>
 where
@@ -1465,27 +1481,37 @@ where
     F: Fn(&DP::V) -> DP::VS,
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
-    let context = DominatingContext {
-        root_package: root,
-        root_version: version,
-        maximized_packages: packages,
-        ordering,
-        required_terms: required,
-    };
+    let root = context.root_package;
+    let version = context.root_version;
+    let packages = context.maximized_packages;
+    let ordering = context.ordering;
+    let required = context.required_terms;
     let mut solver = SolverState::new(root.clone(), version.clone());
     force_terms(&mut solver, root, version, required);
     observer.on_event(SolverEvent::EnumerationRunStarted { run: 1 });
     let result = solver.run_until_solution(provider, observer);
     observer.on_event(SolverEvent::EnumerationRunFinished { run: 1 });
     let solution = result?;
-    let reference = maximize_solution(provider, solution, &context, observer)?;
+    let reference = maximize_solution(provider, solution, context, observer)?;
     let mut witnesses = Vec::new();
     let mut invariants = Vec::new();
+    // Prove high-impact separators first. Fixing a shared hub often makes the expensive
+    // invariant questions for its consumers unnecessary altogether.
+    let mut separators = Vec::new();
     for package in packages {
         let state = reference.get(package).map_or_else(
             || Term::Negative(DP::VS::full()),
             |version| Term::Positive((ordering.same_version)(version)),
         );
+        let mut tentative = required.to_vec();
+        tentative.push((package.clone(), state.clone()));
+        let partition = model.partition(provider, root, version, packages, &tentative)?;
+        if partition.variable.len() > 1 {
+            separators.push((partition.variable.len(), package, state));
+        }
+    }
+    separators.sort_by_key(|(score, _, _)| std::cmp::Reverse(*score));
+    for (_, package, state) in separators {
         let agrees = |solution: &SelectedDependencies<DP::P, DP::V>| {
             solution
                 .get(package)
@@ -1494,6 +1520,19 @@ where
         if witnesses.iter().any(|witness| !agrees(witness)) {
             continue;
         }
+        // Proving an invariant is useful for factorization only when fixing it can disconnect
+        // the residual problem. Do not enumerate counterexamples for every leaf package just
+        // to rediscover a fact that cannot split its component. This is a cost heuristic only:
+        // skipped states remain unconstrained and are handled by exact front enumeration.
+        let mut tentative = required.to_vec();
+        tentative.extend(invariants.iter().cloned());
+        let before = model.partition(provider, root, version, packages, &tentative)?;
+        tentative.push((package.clone(), state.clone()));
+        let after = model.partition(provider, root, version, packages, &tentative)?;
+        if after.variable.len() <= before.variable.len() {
+            continue;
+        }
+        observer.on_event(SolverEvent::InvariantProbeStarted { package });
         let mut probe = SolverState::new(root.clone(), version.clone());
         force_terms(&mut probe, root, version, required);
         force_terms(&mut probe, root, version, &invariants);
@@ -1521,14 +1560,28 @@ where
                 }
                 Err(error) => return Err(error),
             };
-            let maximal = maximize_solution(provider, candidate, &context, observer)?;
+            let maximal = maximize_solution(provider, candidate.clone(), context, observer)?;
             let alternative = !agrees(&maximal);
+            if !alternative {
+                // This is a strict improvement: it restored the excluded reference state.
+                // Block its proven substitution region, not the product of unrelated choices.
+                let region = model.substitution_region(
+                    &candidate,
+                    &maximal,
+                    packages,
+                    ordering.same_precedence,
+                    ordering.strictly_higher,
+                    package,
+                );
+                probe.add_solution_exclusion(region);
+            }
             exclude_dominated(&mut probe, &maximal, packages, ordering);
             witnesses.push(maximal);
             if alternative {
                 break;
             }
         }
+        observer.on_event(SolverEvent::InvariantProbeFinished { package });
     }
     Ok(invariants)
 }
@@ -1546,10 +1599,32 @@ where
     F: Fn(&DP::V) -> DP::VS,
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
+    // Bounds only tighten during an ascent. Keep the same solver, learned clauses and
+    // dependency cache throughout it; no assumption is retracted or leaked to another branch.
+    let mut probe = SolverState::new(context.root_package.clone(), context.root_version.clone());
+    force_terms(
+        &mut probe,
+        context.root_package,
+        context.root_version,
+        context.required_terms,
+    );
+    let mut continuation = false;
     loop {
         validate_version_ordering(&solution, context.maximized_packages, context.ordering)?;
-        match find_dominating_solution(provider, &solution, context, observer)? {
-            Some(dominating) => solution = dominating,
+        observer.on_event(SolverEvent::MaximalityProbeStarted { continuation });
+        let result = find_dominating_solution(provider, &mut probe, &solution, context, observer);
+        observer.on_event(SolverEvent::MaximalityProbeFinished {
+            result: match &result {
+                Ok(Some(_)) => crate::MaximalityProbeResult::Improved,
+                Ok(None) => crate::MaximalityProbeResult::NoImprovement,
+                Err(_) => crate::MaximalityProbeResult::Error,
+            },
+        });
+        match result? {
+            Some(dominating) => {
+                solution = dominating;
+                continuation = true;
+            }
             None => return Ok(solution),
         }
     }
@@ -1741,6 +1816,7 @@ struct DominatingContext<'a, DP: DependencyProvider, E, R, F> {
 
 fn find_dominating_solution<DP, E, R, F, O>(
     dependency_provider: &DP,
+    probe: &mut SolverState<DP>,
     solution: &SelectedDependencies<DP::P, DP::V>,
     context: &DominatingContext<'_, DP, E, R, F>,
     observer: &mut O,
@@ -1752,66 +1828,38 @@ where
     F: Fn(&DP::V) -> DP::VS,
     O: SolverObserver<DP::P, DP::VS, DP::M>,
 {
-    for candidate in context.maximized_packages {
-        if solution.get(candidate).is_none() {
-            continue;
-        }
-        let mut probe =
-            SolverState::new(context.root_package.clone(), context.root_version.clone());
-        force_terms(
-            &mut probe,
-            context.root_package,
-            context.root_version,
-            context.required_terms,
-        );
-        let root_term = || {
-            (
-                context.root_package.clone(),
-                Term::Positive(DP::VS::singleton(context.root_version.clone())),
-            )
-        };
-
-        for selected in context.maximized_packages {
-            let Some(version) = solution.get(selected) else {
-                probe.add_solution_exclusion([
-                    root_term(),
-                    (selected.clone(), Term::Positive(DP::VS::full())),
-                ]);
-                continue;
-            };
-            let required = if selected == candidate {
-                (context.ordering.strictly_higher)(version)
-            } else {
-                (context.ordering.same_precedence)(version).union(&(context
-                    .ordering
-                    .strictly_higher)(
-                    version
-                ))
-            };
+    let root_term = || {
+        (
+            context.root_package.clone(),
+            Term::Positive(DP::VS::singleton(context.root_version.clone())),
+        )
+    };
+    // Same support, no coordinate decreases, and NOT(all coordinates fail to improve).
+    // The last clause is the disjunction of all possible strict improvements. It replaces
+    // one fresh solve per coordinate without ordering or discarding equal-rank realizations.
+    let mut no_improvement = vec![root_term()];
+    for package in context.maximized_packages {
+        let Some(version) = solution.get(package) else {
             probe.add_solution_exclusion([
                 root_term(),
-                (selected.clone(), Term::Negative(required)),
+                (package.clone(), Term::Positive(DP::VS::full())),
             ]);
-        }
-
-        observer.on_event(SolverEvent::MaximalityProbeStarted { package: candidate });
-        let result = probe.run_until_solution(dependency_provider, observer);
-        let probe_result = match &result {
-            Ok(_) => crate::MaximalityProbeResult::Improved,
-            Err(PubGrubError::NoSolution(_)) => crate::MaximalityProbeResult::NoImprovement,
-            Err(_) => crate::MaximalityProbeResult::Error,
+            continue;
         };
-        observer.on_event(SolverEvent::MaximalityProbeFinished {
-            package: candidate,
-            result: probe_result,
-        });
-        match result {
-            Ok(solution) => return Ok(Some(solution)),
-            Err(PubGrubError::NoSolution(_)) => {}
-            Err(error) => return Err(error),
-        }
+        let higher = (context.ordering.strictly_higher)(version);
+        let required = (context.ordering.same_precedence)(version).union(&higher);
+        probe.add_solution_exclusion([root_term(), (package.clone(), Term::Negative(required))]);
+        no_improvement.push((package.clone(), Term::Negative(higher)));
     }
-    Ok(None)
+    probe.add_solution_exclusion(no_improvement);
+    // Keep the witness's arbitrary equal-rank and internal choices unless propagation forces
+    // a change. This is only a branching preference, not an additional constraint or objective.
+    let result = probe.run_until_solution_preferring(dependency_provider, observer, Some(solution));
+    match result {
+        Ok(solution) => Ok(Some(solution)),
+        Err(PubGrubError::NoSolution(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// The dependencies of a package with their version ranges.

@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 
 use pubgrub::{
-    OfflineDependencyProvider, PackagePreference, Ranges, SolverEvent, SolverObserver,
-    VersionOrdering, resolve_factored_maximal_solutions_for_preference_decisions,
+    DependencyProvider, OfflineDependencyProvider, PackagePreference, Ranges, SolverEvent,
+    SolverObserver, VersionOrdering, resolve_factored_maximal_solutions_for_preference_decisions,
+    resolve_factored_maximal_solutions_for_preference_decisions_with_observer,
     resolve_factored_preference_solutions,
     resolve_for_preference_and_package_decisions_with_observer, resolve_maximal_solutions,
     resolve_maximal_solutions_for_preference_decisions, resolve_maximal_solutions_with_observer,
@@ -10,6 +11,51 @@ use pubgrub::{
 };
 
 type Provider = OfflineDependencyProvider<&'static str, Ranges<u32>>;
+
+#[test]
+fn invariant_proofs_prune_optional_products_with_local_substitutions() {
+    let mut provider = Provider::new();
+    provider.add_dependencies("root", 1u32, [("shared", Ranges::full())]);
+    for version in 1..=2u32 {
+        provider.add_dependencies(
+            "shared",
+            version,
+            [("artifact", Ranges::singleton(version))],
+        );
+        provider.add_dependencies(
+            "artifact",
+            version,
+            [("shared", Ranges::singleton(version))],
+        );
+    }
+    let optional = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"];
+    for package in optional {
+        // Unlike the other invariant test, the lower shared version permits EVERY presence
+        // combination. Whole-assignment dominance cuts would revisit that 2^12 product.
+        provider.add_dependencies(package, 1u32, [("shared", Ranges::full())]);
+        provider.add_dependencies(package, 2u32, [("shared", Ranges::singleton(2u32))]);
+    }
+    let mut observer = SolutionCounter::default();
+    let factored = resolve_factored_maximal_solutions_for_preference_decisions_with_observer(
+        &provider,
+        "root",
+        1u32,
+        std::iter::empty(),
+        std::iter::once("shared").chain(optional).collect(),
+        ordering(),
+        &mut observer,
+    )
+    .unwrap();
+    assert_eq!(factored.complete_assignment_count(), Some(4096));
+    assert_eq!(factored.factors().len(), 13);
+    assert!(
+        observer.runs_started < 200,
+        "independent presence states were expanded: {} runs",
+        observer.runs_started
+    );
+    assert_eq!(observer.runs_started, observer.runs_finished);
+    assert_eq!(observer.probes_started, observer.probes_finished);
+}
 
 #[test]
 fn frontier_invariants_split_optional_consumers_before_product_enumeration() {
@@ -631,6 +677,7 @@ struct SolutionCounter {
     runs_finished: usize,
     probes_started: usize,
     probes_finished: usize,
+    continued_probes: usize,
 }
 
 impl SolverObserver<&'static str, Ranges<u32>, String> for SolutionCounter {
@@ -639,7 +686,10 @@ impl SolverObserver<&'static str, Ranges<u32>, String> for SolutionCounter {
             SolverEvent::Solution => self.solutions += 1,
             SolverEvent::EnumerationRunStarted { .. } => self.runs_started += 1,
             SolverEvent::EnumerationRunFinished { .. } => self.runs_finished += 1,
-            SolverEvent::MaximalityProbeStarted { .. } => self.probes_started += 1,
+            SolverEvent::MaximalityProbeStarted { continuation } => {
+                self.probes_started += 1;
+                self.continued_probes += usize::from(continuation);
+            }
             SolverEvent::MaximalityProbeFinished { .. } => self.probes_finished += 1,
             _ => {}
         }
@@ -648,6 +698,68 @@ impl SolverObserver<&'static str, Ranges<u32>, String> for SolutionCounter {
     fn captures_derivation_trees(&self) -> bool {
         false
     }
+}
+
+#[test]
+fn a_monotonic_ascent_reuses_state_across_multiple_strict_improvements() {
+    struct LowestFirst(Provider);
+    impl DependencyProvider for LowestFirst {
+        type P = &'static str;
+        type V = u32;
+        type VS = Ranges<u32>;
+        type M = String;
+        type Err = std::convert::Infallible;
+        type Priority = <Provider as DependencyProvider>::Priority;
+
+        fn prioritize(
+            &self,
+            package: &Self::P,
+            range: &Self::VS,
+            stats: &pubgrub::PackageResolutionStatistics,
+        ) -> Self::Priority {
+            self.0.prioritize(package, range, stats)
+        }
+
+        fn choose_version(
+            &self,
+            package: &Self::P,
+            range: &Self::VS,
+        ) -> Result<Option<u32>, Self::Err> {
+            Ok(self
+                .0
+                .versions(package)
+                .and_then(|mut versions| versions.find(|v| range.contains(v)).copied()))
+        }
+
+        fn get_dependencies(
+            &self,
+            package: &Self::P,
+            version: &u32,
+        ) -> Result<pubgrub::Dependencies<Self::P, Self::VS, String>, Self::Err> {
+            self.0.get_dependencies(package, version)
+        }
+    }
+    let mut provider = Provider::new();
+    provider.add_dependencies("root", 1u32, [("a", Ranges::full()), ("b", Ranges::full())]);
+    for package in ["a", "b"] {
+        for version in 1..=3u32 {
+            provider.add_dependencies(package, version, []);
+        }
+    }
+    let mut observer = SolutionCounter::default();
+    let solutions = resolve_maximal_solutions_with_observer(
+        &LowestFirst(provider),
+        "root",
+        1u32,
+        ["a", "b"],
+        ordering(),
+        &mut observer,
+    )
+    .unwrap();
+    assert_eq!(projected(solutions), BTreeSet::from([(3, 3)]));
+    assert_eq!(observer.probes_started, 5);
+    assert_eq!(observer.continued_probes, 4);
+    assert_eq!(observer.probes_started, observer.probes_finished);
 }
 
 #[test]
@@ -678,7 +790,10 @@ fn observer_reports_only_retained_solutions() {
     assert_eq!(observer.solutions, 1);
     assert_eq!(observer.runs_started, 2);
     assert_eq!(observer.runs_started, observer.runs_finished);
-    assert!(observer.probes_started > 0);
+    assert_eq!(
+        observer.probes_started, 1,
+        "all strict improvements are tested jointly"
+    );
     assert_eq!(observer.probes_started, observer.probes_finished);
 }
 
